@@ -1,0 +1,15 @@
+[package]
+name = "secret-engine-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+tokio.workspace = true
+url.workspace = true
+secret-engine-core = { path = "../core" }
