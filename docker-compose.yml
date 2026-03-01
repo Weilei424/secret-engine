@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: secret_engine
+      POSTGRES_USER: secret
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secret -d secret_engine"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: deploy/docker/server.Dockerfile
+    environment:
+      SECRET_ENGINE__HOST: 0.0.0.0
+      SECRET_ENGINE__PORT: 8080
+      SECRET_ENGINE__DATABASE_URL: postgres://secret:secret@postgres:5432/secret_engine
+      SECRET_ENGINE__ADMIN_TOKEN: dev-root-token
+      SECRET_ENGINE__MASTER_KEY: dev-master-key-change-me
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/docker/web.Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8080
+    depends_on:
+      - server
+    ports:
+      - "3000:80"
+
+volumes:
+  postgres_data:
