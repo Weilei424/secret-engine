@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: secret-engine-config
+  namespace: secret-engine
+type: Opaque
+stringData:
+  SECRET_ENGINE__DATABASE_URL: postgres://secret:secret@postgres.secret-engine.svc.cluster.local:5432/secret_engine
+  SECRET_ENGINE__ADMIN_TOKEN: dev-root-token
+  SECRET_ENGINE__MASTER_KEY: change-me-before-production
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secret-engine-server
+  namespace: secret-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secret-engine-server
+  template:
+    metadata:
+      labels:
+        app: secret-engine-server
+    spec:
+      containers:
+        - name: server
+          image: ghcr.io/example/secret-engine-server:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SECRET_ENGINE__HOST
+              value: 0.0.0.0
+            - name: SECRET_ENGINE__PORT
+              value: "8080"
+          envFrom:
+            - secretRef:
+                name: secret-engine-config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secret-engine-server
+  namespace: secret-engine
+spec:
+  selector:
+    app: secret-engine-server
+  ports:
+    - port: 8080
+      targetPort: 8080
