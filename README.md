@@ -41,6 +41,27 @@ secretsctl kv list --prefix apps/
 secretsctl kv delete apps/demo/password
 ```
 
+## Token management
+
+On startup, the configured `SECRET_ENGINE__ADMIN_TOKEN` is seeded into the database as the bootstrap admin token.
+
+You can mint a scoped service token with:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/tokens \
+  -H 'Authorization: Bearer dev-root-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "label": "demo-reader",
+    "admin": false,
+    "scopes": [
+      { "mount": "kv", "path_prefix": "apps/demo" }
+    ]
+  }'
+```
+
+Use the returned token as the bearer credential for subsequent API calls.
+
 ## Current scope
 
 - Single bootstrap admin token.
