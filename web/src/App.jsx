@@ -28,12 +28,18 @@ export function App() {
   }, []);
 
   async function request(method, path, body) {
+    const headers = {};
+
+    if (body) {
+      headers["Content-Type"] = "application/json";
+    }
+    if (state.token.trim()) {
+      headers.Authorization = `Bearer ${state.token.trim()}`;
+    }
+
     const response = await fetch(`${apiBase}${path}`, {
       method,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${state.token}`
-      },
+      headers,
       body: body ? JSON.stringify(body) : undefined
     });
 
