@@ -10,7 +10,7 @@ use axum::{
 };
 use config::{Config, Environment};
 use secret_engine_core::{
-    crypto::{AesGcmCipher, CiphertextEnvelope},
+    crypto::{AesGcmCipher, CiphertextEnvelope, SecretCipher},
     model::{
         SecretListResponse, SecretMetadata, SecretReadResponse, SecretWriteRequest,
         SecretWriteResponse,
@@ -378,5 +378,31 @@ impl IntoResponse for ApiError {
             error: self.message,
         });
         (self.status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_secret_path;
+
+    #[test]
+    fn split_secret_path_supports_nested_paths() {
+        let (path, key) = split_secret_path("apps/demo/password").expect("path should parse");
+        assert_eq!(path, "apps/demo");
+        assert_eq!(key, "password");
+    }
+
+    #[test]
+    fn split_secret_path_allows_root_key() {
+        let (path, key) = split_secret_path("token").expect("root key should parse");
+        assert_eq!(path, "");
+        assert_eq!(key, "token");
+    }
+
+    #[test]
+    fn split_secret_path_rejects_empty_input() {
+        let error = split_secret_path("/").expect_err("empty path should fail");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "secret path cannot be empty");
     }
 }
