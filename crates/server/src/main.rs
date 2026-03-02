@@ -13,10 +13,12 @@ use secret_engine_core::{
     crypto::{AesGcmCipher, CiphertextEnvelope, SecretCipher},
     model::{
         SecretListResponse, SecretMetadata, SecretReadResponse, SecretWriteRequest,
-        SecretWriteResponse,
+        SecretWriteResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse,
+        TokenMetadata, TokenScope,
     },
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
@@ -46,7 +48,6 @@ impl Settings {
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
-    admin_token: Arc<String>,
     cipher: Arc<AesGcmCipher>,
 }
 
@@ -76,6 +77,28 @@ struct SecretRow {
     version: i32,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct ServiceTokenRow {
+    id: Uuid,
+    label: String,
+    is_admin: bool,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct TokenPolicyRow {
+    mount: String,
+    path_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuthContext {
+    token_id: Uuid,
+    is_admin: bool,
 }
 
 impl From<SecretRow> for SecretMetadata {
@@ -113,15 +136,23 @@ async fn main() -> AnyResult<()> {
         .await
         .context("failed to run migrations")?;
 
+    ensure_bootstrap_token(&pool, &settings.admin_token)
+        .await
+        .context("failed to seed bootstrap token")?;
+
     let state = AppState {
         pool,
-        admin_token: Arc::new(settings.admin_token),
         cipher: Arc::new(AesGcmCipher::from_passphrase(&settings.master_key)),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/auth/validate", get(validate_token))
+        .route("/api/v1/tokens", get(list_tokens).post(create_token))
+        .route(
+            "/api/v1/tokens/:token_id",
+            axum::routing::delete(delete_token),
+        )
         .route("/api/v1/kv/:mount", get(list_secrets))
         .route(
             "/api/v1/kv/:mount/*path",
@@ -148,8 +179,122 @@ async fn validate_token(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> std::result::Result<StatusCode, ApiError> {
-    authorize(&headers, &state)?;
+    authenticate(&headers, &state).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_tokens(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<TokenListResponse>, ApiError> {
+    authorize_admin(&headers, &state).await?;
+
+    let rows = sqlx::query_as::<_, ServiceTokenRow>(
+        r#"
+        SELECT id, label, is_admin, expires_at, created_at, updated_at
+        FROM service_tokens
+        ORDER BY created_at ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let metadata = load_token_metadata(&state.pool, row).await?;
+        items.push(metadata);
+    }
+
+    Ok(Json(TokenListResponse { items }))
+}
+
+async fn create_token(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<TokenCreateRequest>,
+) -> std::result::Result<Json<TokenCreateResponse>, ApiError> {
+    authorize_admin(&headers, &state).await?;
+
+    let TokenCreateRequest {
+        label,
+        admin,
+        expires_at,
+        scopes: requested_scopes,
+    } = payload;
+
+    if label.trim().is_empty() {
+        return Err(ApiError::bad_request("token label cannot be empty"));
+    }
+
+    if !admin && requested_scopes.is_empty() {
+        return Err(ApiError::bad_request(
+            "non-admin tokens require at least one scope",
+        ));
+    }
+
+    let mut scopes = Vec::with_capacity(requested_scopes.len());
+    for scope in requested_scopes {
+        let mount = scope.mount.trim().to_string();
+        if mount.is_empty() {
+            return Err(ApiError::bad_request("token scope mount cannot be empty"));
+        }
+
+        scopes.push(TokenScope {
+            mount,
+            path_prefix: normalize_path_prefix(&scope.path_prefix),
+        });
+    }
+
+    let plain_token = format!("se_{}", Uuid::new_v4().simple());
+    let token_hash = hash_token(&plain_token);
+    let token_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO service_tokens (id, label, token_hash, is_admin, expires_at)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(token_id)
+    .bind(label.trim())
+    .bind(token_hash)
+    .bind(admin)
+    .bind(expires_at)
+    .execute(&state.pool)
+    .await?;
+
+    for scope in &scopes {
+        sqlx::query(
+            r#"
+            INSERT INTO service_token_policies (token_id, mount, path_prefix)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(token_id)
+        .bind(&scope.mount)
+        .bind(&scope.path_prefix)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    let row = sqlx::query_as::<_, ServiceTokenRow>(
+        r#"
+        SELECT id, label, is_admin, expires_at, created_at, updated_at
+        FROM service_tokens
+        WHERE id = $1
+        "#,
+    )
+    .bind(token_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let metadata = load_token_metadata(&state.pool, row).await?;
+
+    Ok(Json(TokenCreateResponse {
+        token: plain_token,
+        metadata,
+    }))
 }
 
 async fn list_secrets(
@@ -158,9 +303,9 @@ async fn list_secrets(
     Query(query): Query<ListQuery>,
     State(state): State<AppState>,
 ) -> std::result::Result<Json<SecretListResponse>, ApiError> {
-    authorize(&headers, &state)?;
+    let prefix = normalize_path_prefix(query.prefix.as_deref().unwrap_or_default());
+    authorize_path(&headers, &state, &mount, &prefix).await?;
 
-    let prefix = query.prefix.unwrap_or_default();
     let like_value = if prefix.is_empty() {
         "%".to_string()
     } else {
@@ -189,9 +334,9 @@ async fn read_secret(
     Path((mount, path)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> std::result::Result<Json<SecretReadResponse>, ApiError> {
-    authorize(&headers, &state)?;
-
     let (secret_path, key) = split_secret_path(&path)?;
+    authorize_path(&headers, &state, &mount, &secret_path).await?;
+
     let row = sqlx::query_as::<_, SecretRow>(
         r#"
         SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at
@@ -231,9 +376,9 @@ async fn write_secret(
     State(state): State<AppState>,
     Json(payload): Json<SecretWriteRequest>,
 ) -> std::result::Result<Json<SecretWriteResponse>, ApiError> {
-    authorize(&headers, &state)?;
-
     let (secret_path, key) = split_secret_path(&path)?;
+    authorize_path(&headers, &state, &mount, &secret_path).await?;
+
     let encrypted = state
         .cipher
         .encrypt(&payload.value)
@@ -274,9 +419,9 @@ async fn delete_secret(
     Path((mount, path)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> std::result::Result<StatusCode, ApiError> {
-    authorize(&headers, &state)?;
-
     let (secret_path, key) = split_secret_path(&path)?;
+    authorize_path(&headers, &state, &mount, &secret_path).await?;
+
     let result = sqlx::query(
         r#"
         DELETE FROM secrets
@@ -296,8 +441,142 @@ async fn delete_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn authorize(headers: &HeaderMap, state: &AppState) -> std::result::Result<(), ApiError> {
-    let expected = state.admin_token.as_str();
+async fn delete_token(
+    headers: HeaderMap,
+    Path(token_id): Path<Uuid>,
+    State(state): State<AppState>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let auth = authorize_admin(&headers, &state).await?;
+    if auth.token_id == token_id {
+        return Err(ApiError::bad_request(
+            "cannot delete the token used for this request",
+        ));
+    }
+
+    let result = sqlx::query(
+        r#"
+        DELETE FROM service_tokens
+        WHERE id = $1
+        "#,
+    )
+    .bind(token_id)
+    .execute(&state.pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("token not found"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn ensure_bootstrap_token(pool: &PgPool, token: &str) -> AnyResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO service_tokens (label, token_hash, is_admin, bootstrap_slot)
+        VALUES ('bootstrap-admin', $1, TRUE, 1)
+        ON CONFLICT (bootstrap_slot)
+        DO UPDATE SET
+            token_hash = EXCLUDED.token_hash,
+            is_admin = TRUE,
+            expires_at = NULL,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(hash_token(token.trim()))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn load_token_metadata(
+    pool: &PgPool,
+    row: ServiceTokenRow,
+) -> std::result::Result<TokenMetadata, ApiError> {
+    let scopes = sqlx::query_as::<_, TokenPolicyRow>(
+        r#"
+        SELECT mount, path_prefix
+        FROM service_token_policies
+        WHERE token_id = $1
+        ORDER BY mount ASC, path_prefix ASC
+        "#,
+    )
+    .bind(row.id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|scope| TokenScope {
+        mount: scope.mount,
+        path_prefix: scope.path_prefix,
+    })
+    .collect();
+
+    Ok(TokenMetadata {
+        id: row.id,
+        label: row.label,
+        admin: row.is_admin,
+        expires_at: row.expires_at,
+        scopes,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+async fn authorize_admin(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> std::result::Result<AuthContext, ApiError> {
+    let auth = authenticate(headers, state).await?;
+    if !auth.is_admin {
+        return Err(ApiError::forbidden("admin token required"));
+    }
+    Ok(auth)
+}
+
+async fn authorize_path(
+    headers: &HeaderMap,
+    state: &AppState,
+    mount: &str,
+    path: &str,
+) -> std::result::Result<AuthContext, ApiError> {
+    let auth = authenticate(headers, state).await?;
+    if auth.is_admin {
+        return Ok(auth);
+    }
+
+    let allowed = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM service_token_policies
+            WHERE token_id = $1
+              AND mount = $2
+              AND (
+                path_prefix = ''
+                OR $3 = path_prefix
+                OR $3 LIKE path_prefix || '/%'
+              )
+        )
+        "#,
+    )
+    .bind(auth.token_id)
+    .bind(mount)
+    .bind(normalize_path_prefix(path))
+    .fetch_one(&state.pool)
+    .await?;
+
+    if !allowed {
+        return Err(ApiError::forbidden("token is not allowed for this path"));
+    }
+
+    Ok(auth)
+}
+
+async fn authenticate(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> std::result::Result<AuthContext, ApiError> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -307,11 +586,25 @@ fn authorize(headers: &HeaderMap, state: &AppState) -> std::result::Result<(), A
         return Err(ApiError::unauthorized("expected Bearer token"));
     };
 
-    if token != expected {
-        return Err(ApiError::unauthorized("token rejected"));
-    }
+    let row = sqlx::query_as::<_, ServiceTokenRow>(
+        r#"
+        SELECT id, label, is_admin, expires_at, created_at, updated_at
+        FROM service_tokens
+        WHERE token_hash = $1
+          AND (expires_at IS NULL OR expires_at > NOW())
+        "#,
+    )
+    .bind(hash_token(token.trim()))
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::unauthorized("token rejected"))?;
 
-    Ok(())
+    let ServiceTokenRow { id, is_admin, .. } = row;
+
+    Ok(AuthContext {
+        token_id: id,
+        is_admin,
+    })
 }
 
 fn split_secret_path(raw: &str) -> std::result::Result<(String, String), ApiError> {
@@ -331,6 +624,15 @@ fn split_secret_path(raw: &str) -> std::result::Result<(String, String), ApiErro
     Ok((path, key))
 }
 
+fn normalize_path_prefix(value: &str) -> String {
+    value.trim_matches('/').to_string()
+}
+
+fn hash_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!("{digest:x}")
+}
+
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -347,6 +649,13 @@ impl ApiError {
     fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
         }
     }
@@ -384,6 +693,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::split_secret_path;
+    use axum::http::StatusCode;
 
     #[test]
     fn split_secret_path_supports_nested_paths() {
