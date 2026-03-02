@@ -156,13 +156,9 @@ impl Api {
     }
 
     async fn kv_list(&self, args: KvListArgs) -> Result<()> {
-        let mut path = format!("/api/v1/kv/{}", args.mount);
-        if let Some(prefix) = args.prefix {
-            path = format!("{path}?prefix={prefix}");
-        }
-
+        let url = self.kv_list_url(&args)?;
         let response: SecretListResponse = self
-            .send::<()>(Method::GET, &path, None)
+            .send_url::<()>(Method::GET, url, None)
             .await?
             .json()
             .await?;
@@ -182,7 +178,19 @@ impl Api {
     where
         T: serde::Serialize + ?Sized,
     {
-        let mut request = self.client.request(method, self.url(path)?);
+        self.send_url(method, self.url(path)?, body).await
+    }
+
+    async fn send_url<T>(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<&T>,
+    ) -> Result<reqwest::Response>
+    where
+        T: serde::Serialize + ?Sized,
+    {
+        let mut request = self.client.request(method, url);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
@@ -202,5 +210,13 @@ impl Api {
 
     fn url(&self, path: &str) -> Result<Url> {
         self.base_url.join(path).context("failed to build url")
+    }
+
+    fn kv_list_url(&self, args: &KvListArgs) -> Result<Url> {
+        let mut url = self.url(&format!("/api/v1/kv/{}", args.mount))?;
+        if let Some(prefix) = &args.prefix {
+            url.query_pairs_mut().append_pair("prefix", prefix);
+        }
+        Ok(url)
     }
 }
