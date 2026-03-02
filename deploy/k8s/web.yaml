@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secret-engine-web-config
+  namespace: secret-engine
+data:
+  config.js: |
+    window.__SECRET_ENGINE_CONFIG__ = {
+      apiBaseUrl: "http://localhost:8080"
+    };
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secret-engine-web
+  namespace: secret-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secret-engine-web
+  template:
+    metadata:
+      labels:
+        app: secret-engine-web
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/example/secret-engine-web:latest
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: runtime-config
+              mountPath: /usr/share/nginx/html/config.js
+              subPath: config.js
+      volumes:
+        - name: runtime-config
+          configMap:
+            name: secret-engine-web-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secret-engine-web
+  namespace: secret-engine
+spec:
+  selector:
+    app: secret-engine-web
+  ports:
+    - port: 80
+      targetPort: 80
