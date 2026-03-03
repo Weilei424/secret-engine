@@ -24,6 +24,8 @@
 3. Use the API at `http://localhost:8080`.
 4. Use the default bootstrap token `dev-root-token`.
 
+The API only accepts browser requests from configured origins. For local development, the default allowlist is `http://localhost:3000` and `http://127.0.0.1:3000`.
+
 ## Rust builds on mounted drives
 
 This repository is configured to place Cargo build artifacts in `/tmp/secret-engine-target` via [`.cargo/config.toml`](/mnt/g/My%20Drive/Projects/secret-engine/.cargo/config.toml). That avoids `Text file busy (os error 26)` failures that can happen when build scripts are executed directly from synced or mounted filesystems.
