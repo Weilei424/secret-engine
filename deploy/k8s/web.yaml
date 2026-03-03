@@ -6,8 +6,34 @@ metadata:
 data:
   config.js: |
     window.__SECRET_ENGINE_CONFIG__ = {
-      apiBaseUrl: "http://localhost:8080"
+      apiBaseUrl: ""
     };
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+
+        root /usr/share/nginx/html;
+        index index.html;
+
+        location /api/ {
+            proxy_pass http://secret-engine-server.secret-engine.svc.cluster.local:8080;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location = /health {
+            proxy_pass http://secret-engine-server.secret-engine.svc.cluster.local:8080/health;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location / {
+            try_files $uri /index.html;
+        }
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -24,15 +50,48 @@ spec:
       labels:
         app: secret-engine-web
     spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: web
-          image: ghcr.io/example/secret-engine-web:latest
+          image: ghcr.io/example/secret-engine-web:0.1.0
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - NET_BIND_SERVICE
+              drop:
+                - ALL
           volumeMounts:
             - name: runtime-config
               mountPath: /usr/share/nginx/html/config.js
               subPath: config.js
+            - name: runtime-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
       volumes:
         - name: runtime-config
           configMap:
