@@ -68,5 +68,9 @@ Use the returned token as the bearer credential for subsequent API calls.
 
 - Single bootstrap admin token.
 - Vault-like KV pathing (`/api/v1/kv/<mount>/<path>/<key>`).
-- AES-256-GCM encryption with a passphrase-derived master key.
+- AES-256-GCM encryption with an Argon2id-derived master key for new writes.
 - Encryption is isolated behind a trait so it can be replaced later with a stronger key-management model.
+
+## Kubernetes note
+
+The checked-in Kubernetes workload manifests reference pre-created secrets instead of embedding credentials directly. Use [secrets.example.yaml](/mnt/g/My%20Drive/Projects/secret-engine/deploy/k8s/secrets.example.yaml) as a template and replace every `REPLACE_WITH_...` value before applying it to a cluster.
