@@ -147,7 +147,10 @@ async fn main() -> AnyResult<()> {
 
     let state = AppState {
         pool,
-        cipher: Arc::new(AesGcmCipher::from_passphrase(&settings.master_key)),
+        cipher: Arc::new(
+            AesGcmCipher::from_passphrase(&settings.master_key)
+                .context("failed to derive master key")?,
+        ),
     };
     let cors = build_cors_layer(&settings).context("invalid CORS configuration")?;
 
