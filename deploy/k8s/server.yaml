@@ -1,14 +1,3 @@
-apiVersion: v1
-kind: Secret
-metadata:
-  name: secret-engine-config
-  namespace: secret-engine
-type: Opaque
-stringData:
-  SECRET_ENGINE__DATABASE_URL: postgres://secret_engine:REPLACE_WITH_STRONG_POSTGRES_PASSWORD@postgres.secret-engine.svc.cluster.local:5432/secret_engine
-  SECRET_ENGINE__ADMIN_TOKEN: REPLACE_WITH_LONG_RANDOM_BOOTSTRAP_TOKEN
-  SECRET_ENGINE__MASTER_KEY: REPLACE_WITH_LONG_RANDOM_MASTER_KEY
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:

@@ -1,15 +1,4 @@
 apiVersion: v1
-kind: Secret
-metadata:
-  name: postgres-secret
-  namespace: secret-engine
-type: Opaque
-stringData:
-  POSTGRES_DB: secret_engine
-  POSTGRES_USER: secret_engine
-  POSTGRES_PASSWORD: REPLACE_WITH_STRONG_POSTGRES_PASSWORD
----
-apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: postgres-data
