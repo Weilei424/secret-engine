@@ -5,9 +5,9 @@ metadata:
   namespace: secret-engine
 type: Opaque
 stringData:
-  SECRET_ENGINE__DATABASE_URL: postgres://secret:secret@postgres.secret-engine.svc.cluster.local:5432/secret_engine
-  SECRET_ENGINE__ADMIN_TOKEN: dev-root-token
-  SECRET_ENGINE__MASTER_KEY: change-me-before-production
+  SECRET_ENGINE__DATABASE_URL: postgres://secret_engine:REPLACE_WITH_STRONG_POSTGRES_PASSWORD@postgres.secret-engine.svc.cluster.local:5432/secret_engine
+  SECRET_ENGINE__ADMIN_TOKEN: REPLACE_WITH_LONG_RANDOM_BOOTSTRAP_TOKEN
+  SECRET_ENGINE__MASTER_KEY: REPLACE_WITH_LONG_RANDOM_MASTER_KEY
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -24,9 +24,13 @@ spec:
       labels:
         app: secret-engine-server
     spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: server
-          image: ghcr.io/example/secret-engine-server:latest
+          image: ghcr.io/example/secret-engine-server:0.1.0
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
           env:
@@ -37,6 +41,22 @@ spec:
           envFrom:
             - secretRef:
                 name: secret-engine-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           readinessProbe:
             httpGet:
               path: /health
