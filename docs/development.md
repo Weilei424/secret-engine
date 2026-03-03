@@ -172,10 +172,13 @@ Use `-v` only if you want to discard the local PostgreSQL data.
 
 The manifests are raw and intentionally simple.
 
+Before applying the workloads, create real Kubernetes secrets from [secrets.example.yaml](/mnt/g/My%20Drive/Projects/secret-engine/deploy/k8s/secrets.example.yaml) and replace every `REPLACE_WITH_...` value. Treat that file as a template, not a production manifest.
+
 Apply in this order:
 
 ```bash
 kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/secrets.example.yaml
 kubectl apply -f deploy/k8s/postgres.yaml
 kubectl apply -f deploy/k8s/server.yaml
 kubectl apply -f deploy/k8s/web.yaml
@@ -185,7 +188,10 @@ These manifests currently assume:
 
 - images will be built and pushed separately
 - image names will be replaced from the placeholder `ghcr.io/example/...`
+- secret values are created separately from the workload manifests
 - cluster networking is plain HTTP for now
+
+The web manifest now proxies `/api/*` and `/health` to the in-cluster server service, so the browser can use same-origin requests instead of calling `localhost` from inside the cluster.
 
 ## Coding expectations
 

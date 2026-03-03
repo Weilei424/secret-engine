@@ -120,15 +120,15 @@ This schema is intentionally narrow. It supports the current KV use case and kee
 The current implementation uses:
 
 - AES-256-GCM
-- a master key derived from a configured passphrase using SHA-256
+- a master key derived from a configured passphrase using Argon2id for new writes
+- legacy SHA-256-derived ciphertext remains readable during migration
 - a random nonce per secret write
-- a serialized envelope containing the algorithm name and base64 payload
+- a serialized envelope containing a versioned algorithm identifier and base64 payload
 
 This is acceptable for an MVP, but it is not the long-term target for a production-grade secret engine.
 
 The upgrade path is preserved by the `SecretCipher` trait in `crates/core`, which allows replacing the implementation with:
 
-- a proper KDF
 - a keyring-backed master key
 - envelope encryption
 - HSM/KMS integration
