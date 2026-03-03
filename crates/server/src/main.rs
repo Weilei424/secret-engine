@@ -4,7 +4,7 @@ use anyhow::{Context, Result as AnyResult};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::IntoResponse,
     routing::get,
 };
@@ -29,6 +29,7 @@ struct Settings {
     host: String,
     port: u16,
     database_url: String,
+    allowed_origins: Vec<String>,
     admin_token: String,
     master_key: String,
 }
@@ -38,6 +39,10 @@ impl Settings {
         let config = Config::builder()
             .set_default("host", "0.0.0.0")?
             .set_default("port", 8080)?
+            .set_default(
+                "allowed_origins",
+                vec!["http://localhost:3000", "http://127.0.0.1:3000"],
+            )?
             .add_source(Environment::with_prefix("SECRET_ENGINE").separator("__"))
             .build()?;
 
@@ -144,6 +149,7 @@ async fn main() -> AnyResult<()> {
         pool,
         cipher: Arc::new(AesGcmCipher::from_passphrase(&settings.master_key)),
     };
+    let cors = build_cors_layer(&settings).context("invalid CORS configuration")?;
 
     let app = Router::new()
         .route("/health", get(health))
@@ -159,7 +165,7 @@ async fn main() -> AnyResult<()> {
             get(read_secret).post(write_secret).delete(delete_secret),
         )
         .with_state(state)
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", settings.host, settings.port).parse()?;
@@ -173,6 +179,23 @@ async fn main() -> AnyResult<()> {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+fn build_cors_layer(settings: &Settings) -> AnyResult<CorsLayer> {
+    let allowed_origins = settings
+        .allowed_origins
+        .iter()
+        .map(|origin| {
+            origin
+                .parse::<HeaderValue>()
+                .with_context(|| format!("invalid allowed origin: {origin}"))
+        })
+        .collect::<AnyResult<Vec<_>>>()?;
+
+    Ok(CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]))
 }
 
 async fn validate_token(
