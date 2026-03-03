@@ -6,8 +6,8 @@ metadata:
 type: Opaque
 stringData:
   POSTGRES_DB: secret_engine
-  POSTGRES_USER: secret
-  POSTGRES_PASSWORD: secret
+  POSTGRES_USER: secret_engine
+  POSTGRES_PASSWORD: REPLACE_WITH_STRONG_POSTGRES_PASSWORD
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -36,14 +36,31 @@ spec:
       labels:
         app: postgres
     spec:
+      securityContext:
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: postgres
           image: postgres:16
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5432
           envFrom:
             - secretRef:
                 name: postgres-secret
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
