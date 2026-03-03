@@ -2,6 +2,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
+use argon2::{Algorithm, Argon2, Params, Version};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::{RngCore, rngs::OsRng};
@@ -9,8 +10,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+const LEGACY_ALGORITHM: &str = "aes-256-gcm";
+const CURRENT_ALGORITHM: &str = "aes-256-gcm+argon2id-v1";
+const CURRENT_KEY_ID: &str = "static-passphrase-v1";
+const KDF_SALT: &[u8] = b"secret-engine-master-key-v1";
+
 #[derive(Debug, Error)]
 pub enum CryptoError {
+    #[error("key derivation failure")]
+    KeyDerivation,
     #[error("encryption failure")]
     Encrypt,
     #[error("decryption failure")]
@@ -33,30 +41,47 @@ pub trait SecretCipher: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct AesGcmCipher {
-    key: [u8; 32],
+    current_key: [u8; 32],
+    legacy_key: [u8; 32],
+    current_algorithm: String,
 }
 
 impl AesGcmCipher {
-    pub fn from_passphrase(passphrase: &str) -> Self {
+    pub fn from_passphrase(passphrase: &str) -> Result<Self, CryptoError> {
+        let mut current_key = [0_u8; 32];
+        let params =
+            Params::new(64 * 1024, 3, 1, Some(32)).map_err(|_| CryptoError::KeyDerivation)?;
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        argon2
+            .hash_password_into(passphrase.as_bytes(), KDF_SALT, &mut current_key)
+            .map_err(|_| CryptoError::KeyDerivation)?;
+
         let digest = Sha256::digest(passphrase.as_bytes());
-        let mut key = [0_u8; 32];
-        key.copy_from_slice(&digest);
-        Self { key }
+        let mut legacy_key = [0_u8; 32];
+        legacy_key.copy_from_slice(&digest);
+
+        Ok(Self {
+            current_key,
+            legacy_key,
+            current_algorithm: format!("{CURRENT_ALGORITHM}:{CURRENT_KEY_ID}"),
+        })
     }
 
-    fn engine(&self) -> Aes256Gcm {
-        let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&self.key);
+    fn engine(key_bytes: &[u8; 32]) -> Aes256Gcm {
+        let key = aes_gcm::Key::<Aes256Gcm>::from_slice(key_bytes);
         Aes256Gcm::new(key)
     }
-}
 
-#[async_trait]
-impl SecretCipher for AesGcmCipher {
-    async fn encrypt(&self, plaintext: &str) -> Result<CiphertextEnvelope, CryptoError> {
+    fn encrypt_with_key(
+        &self,
+        plaintext: &str,
+        key_bytes: &[u8; 32],
+        algorithm: &str,
+    ) -> Result<CiphertextEnvelope, CryptoError> {
         let mut nonce_bytes = [0_u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
 
-        let cipher = self.engine();
+        let cipher = Self::engine(key_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let encrypted = cipher
             .encrypt(nonce, plaintext.as_bytes())
@@ -66,16 +91,16 @@ impl SecretCipher for AesGcmCipher {
         combined.extend_from_slice(&encrypted);
 
         Ok(CiphertextEnvelope {
-            algorithm: "aes-256-gcm".to_string(),
+            algorithm: algorithm.to_string(),
             payload: BASE64.encode(combined),
         })
     }
 
-    async fn decrypt(&self, envelope: &CiphertextEnvelope) -> Result<String, CryptoError> {
-        if envelope.algorithm != "aes-256-gcm" {
-            return Err(CryptoError::InvalidPayload);
-        }
-
+    fn decrypt_with_key(
+        &self,
+        envelope: &CiphertextEnvelope,
+        key_bytes: &[u8; 32],
+    ) -> Result<String, CryptoError> {
         let bytes = BASE64
             .decode(envelope.payload.as_bytes())
             .map_err(|_| CryptoError::InvalidPayload)?;
@@ -84,12 +109,70 @@ impl SecretCipher for AesGcmCipher {
         }
 
         let (nonce_bytes, ciphertext) = bytes.split_at(12);
-        let cipher = self.engine();
+        let cipher = Self::engine(key_bytes);
         let nonce = Nonce::from_slice(nonce_bytes);
         let decrypted = cipher
             .decrypt(nonce, ciphertext)
             .map_err(|_| CryptoError::Decrypt)?;
 
         String::from_utf8(decrypted).map_err(|_| CryptoError::InvalidPayload)
+    }
+
+    fn key_for_algorithm(&self, algorithm: &str) -> Option<&[u8; 32]> {
+        if algorithm == LEGACY_ALGORITHM {
+            return Some(&self.legacy_key);
+        }
+
+        if algorithm == self.current_algorithm {
+            return Some(&self.current_key);
+        }
+
+        None
+    }
+}
+
+#[async_trait]
+impl SecretCipher for AesGcmCipher {
+    async fn encrypt(&self, plaintext: &str) -> Result<CiphertextEnvelope, CryptoError> {
+        self.encrypt_with_key(plaintext, &self.current_key, &self.current_algorithm)
+    }
+
+    async fn decrypt(&self, envelope: &CiphertextEnvelope) -> Result<String, CryptoError> {
+        let key = self
+            .key_for_algorithm(&envelope.algorithm)
+            .ok_or(CryptoError::InvalidPayload)?;
+
+        self.decrypt_with_key(envelope, key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_uses_versioned_argon2id_algorithm() {
+        let cipher = AesGcmCipher::from_passphrase("test-passphrase").expect("cipher");
+        let envelope = cipher
+            .encrypt_with_key("secret", &cipher.current_key, &cipher.current_algorithm)
+            .expect("encrypt");
+
+        assert_eq!(
+            envelope.algorithm,
+            "aes-256-gcm+argon2id-v1:static-passphrase-v1"
+        );
+    }
+
+    #[test]
+    fn decrypt_accepts_legacy_sha256_payloads() {
+        let cipher = AesGcmCipher::from_passphrase("test-passphrase").expect("cipher");
+        let envelope = cipher
+            .encrypt_with_key("secret", &cipher.legacy_key, LEGACY_ALGORITHM)
+            .expect("legacy encrypt");
+        let plaintext = cipher
+            .decrypt_with_key(&envelope, &cipher.legacy_key)
+            .expect("decrypt");
+
+        assert_eq!(plaintext, "secret");
     }
 }
