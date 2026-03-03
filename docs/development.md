@@ -38,6 +38,7 @@ Important server settings:
 - `SECRET_ENGINE__HOST`
 - `SECRET_ENGINE__PORT`
 - `SECRET_ENGINE__DATABASE_URL`
+- `SECRET_ENGINE__ALLOWED_ORIGINS`
 - `SECRET_ENGINE__ADMIN_TOKEN`
 - `SECRET_ENGINE__MASTER_KEY`
 
@@ -74,6 +75,7 @@ If PostgreSQL is already available:
 
 ```bash
 export SECRET_ENGINE__DATABASE_URL=postgres://secret:secret@127.0.0.1:5432/secret_engine
+export SECRET_ENGINE__ALLOWED_ORIGINS='["http://localhost:3000","http://127.0.0.1:3000"]'
 export SECRET_ENGINE__ADMIN_TOKEN=dev-root-token
 export SECRET_ENGINE__MASTER_KEY=dev-master-key-change-me
 
