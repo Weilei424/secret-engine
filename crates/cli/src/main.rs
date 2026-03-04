@@ -44,7 +44,7 @@ struct LoginArgs {
 #[derive(Debug, Subcommand)]
 enum KvCommand {
     Put(KvPutArgs),
-    Get(KvPathArgs),
+    Get(KvGetArgs),
     Delete(KvPathArgs),
     List(KvListArgs),
 }
@@ -61,6 +61,15 @@ struct KvPutArgs {
 struct KvPathArgs {
     #[arg(long, default_value = "kv")]
     mount: String,
+    path: String,
+}
+
+#[derive(Debug, Args)]
+struct KvGetArgs {
+    #[arg(long, default_value = "kv")]
+    mount: String,
+    #[arg(long)]
+    version: Option<i32>,
     path: String,
 }
 
@@ -133,15 +142,26 @@ impl Api {
         Ok(())
     }
 
-    async fn kv_get(&self, args: KvPathArgs) -> Result<()> {
-        let path = format!("/api/v1/kv/{}/{}", args.mount, args.path);
+    async fn kv_get(&self, args: KvGetArgs) -> Result<()> {
+        let mut url = self.url(&format!("/api/v1/kv/{}/{}", args.mount, args.path))?;
+        if let Some(version) = args.version {
+            url.query_pairs_mut()
+                .append_pair("version", &version.to_string());
+        }
+
         let response: SecretReadResponse = self
-            .send::<()>(Method::GET, &path, None)
+            .send_url::<()>(Method::GET, url, None)
             .await?
             .json()
             .await?;
 
         println!("{}", response.value);
+        if response.version != response.current_version {
+            println!(
+                "read version {} (current version {})",
+                response.version, response.current_version
+            );
+        }
         Ok(())
     }
 
