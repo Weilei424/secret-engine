@@ -2,7 +2,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use reqwest::{Client, Method, StatusCode};
 use secret_engine_core::model::{
-    SecretListResponse, SecretReadResponse, SecretWriteRequest, SecretWriteResponse,
+    SecretListResponse, SecretMetadataResponse, SecretReadResponse, SecretVersionActionRequest,
+    SecretWriteRequest, SecretWriteResponse,
 };
 use url::Url;
 
@@ -45,6 +46,9 @@ struct LoginArgs {
 enum KvCommand {
     Put(KvPutArgs),
     Get(KvGetArgs),
+    Metadata(KvPathArgs),
+    Undelete(KvVersionActionArgs),
+    Destroy(KvVersionActionArgs),
     Delete(KvPathArgs),
     List(KvListArgs),
 }
@@ -81,6 +85,15 @@ struct KvListArgs {
     prefix: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct KvVersionActionArgs {
+    #[arg(long, default_value = "kv")]
+    mount: String,
+    #[arg(long = "version", required = true)]
+    versions: Vec<i32>,
+    path: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -94,6 +107,9 @@ async fn main() -> Result<()> {
         Commands::Kv { command } => match command {
             KvCommand::Put(args) => api.kv_put(args).await?,
             KvCommand::Get(args) => api.kv_get(args).await?,
+            KvCommand::Metadata(args) => api.kv_metadata(args).await?,
+            KvCommand::Undelete(args) => api.kv_undelete(args).await?,
+            KvCommand::Destroy(args) => api.kv_destroy(args).await?,
             KvCommand::Delete(args) => api.kv_delete(args).await?,
             KvCommand::List(args) => api.kv_list(args).await?,
         },
@@ -165,6 +181,36 @@ impl Api {
         Ok(())
     }
 
+    async fn kv_metadata(&self, args: KvPathArgs) -> Result<()> {
+        let path = format!("/api/v1/kv/{}/metadata/{}", args.mount, args.path);
+        let response: SecretMetadataResponse = self
+            .send::<()>(Method::GET, &path, None)
+            .await?
+            .json()
+            .await?;
+
+        println!(
+            "{}/{}/{} latest={} current={}",
+            response.mount,
+            response.path,
+            response.key,
+            response.latest_version,
+            response
+                .current_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        for version in response.versions {
+            let state = if version.deleted_at.is_some() {
+                "deleted"
+            } else {
+                "active"
+            };
+            println!("v{} {}", version.version, state);
+        }
+        Ok(())
+    }
+
     async fn kv_delete(&self, args: KvPathArgs) -> Result<()> {
         let path = format!("/api/v1/kv/{}/{}", args.mount, args.path);
         let response = self.send::<()>(Method::DELETE, &path, None).await?;
@@ -172,6 +218,32 @@ impl Api {
             bail!("delete failed: {}", response.status());
         }
         println!("deleted {}", args.path);
+        Ok(())
+    }
+
+    async fn kv_undelete(&self, args: KvVersionActionArgs) -> Result<()> {
+        let path = format!("/api/v1/kv/{}/undelete/{}", args.mount, args.path);
+        let payload = SecretVersionActionRequest {
+            versions: args.versions,
+        };
+        let response = self.send(Method::POST, &path, Some(&payload)).await?;
+        if response.status() != StatusCode::NO_CONTENT {
+            bail!("undelete failed: {}", response.status());
+        }
+        println!("undeleted {}", args.path);
+        Ok(())
+    }
+
+    async fn kv_destroy(&self, args: KvVersionActionArgs) -> Result<()> {
+        let path = format!("/api/v1/kv/{}/destroy/{}", args.mount, args.path);
+        let payload = SecretVersionActionRequest {
+            versions: args.versions,
+        };
+        let response = self.send(Method::POST, &path, Some(&payload)).await?;
+        if response.status() != StatusCode::NO_CONTENT {
+            bail!("destroy failed: {}", response.status());
+        }
+        println!("destroyed {}", args.path);
         Ok(())
     }
 
