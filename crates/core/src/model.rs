@@ -27,6 +27,24 @@ pub struct SecretMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretVersionMetadata {
+    pub version: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretMetadataResponse {
+    pub mount: String,
+    pub path: String,
+    pub key: String,
+    pub latest_version: i32,
+    pub current_version: Option<i32>,
+    pub versions: Vec<SecretVersionMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretWriteRequest {
     pub value: String,
 }
@@ -53,6 +71,11 @@ pub struct SecretReadResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretListResponse {
     pub items: Vec<SecretMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretVersionActionRequest {
+    pub versions: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
