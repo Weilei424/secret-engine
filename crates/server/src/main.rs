@@ -61,6 +61,11 @@ struct ListQuery {
     prefix: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ReadQuery {
+    version: Option<i32>,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -71,7 +76,7 @@ struct ErrorResponse {
     error: String,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 struct SecretRow {
     id: Uuid,
     mount: String,
@@ -82,6 +87,7 @@ struct SecretRow {
     version: i32,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -110,11 +116,13 @@ impl From<SecretRow> for SecretMetadata {
     fn from(value: SecretRow) -> Self {
         let _ = value.id;
         let _ = value.created_at;
+        let _ = value.deleted_at;
         Self {
             mount: value.mount,
             path: value.path,
             key: value.secret_key,
             version: value.version,
+            current_version: value.version,
             updated_at: value.updated_at,
         }
     }
@@ -340,9 +348,15 @@ async fn list_secrets(
 
     let rows = sqlx::query_as::<_, SecretRow>(
         r#"
-        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at
-        FROM secrets
-        WHERE mount = $1 AND path LIKE $2
+        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+        FROM (
+            SELECT DISTINCT ON (mount, path, secret_key)
+                id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+            FROM secrets
+            WHERE mount = $1 AND path LIKE $2
+            ORDER BY mount, path, secret_key, version DESC
+        ) AS current_secrets
+        WHERE deleted_at IS NULL
         ORDER BY path ASC, secret_key ASC
         "#,
     )
@@ -358,33 +372,41 @@ async fn list_secrets(
 async fn read_secret(
     headers: HeaderMap,
     Path((mount, path)): Path<(String, String)>,
+    Query(query): Query<ReadQuery>,
     State(state): State<AppState>,
 ) -> std::result::Result<Json<SecretReadResponse>, ApiError> {
     let (secret_path, key) = split_secret_path(&path)?;
     authorize_path(&headers, &state, &mount, &secret_path).await?;
+    let latest = load_latest_secret_row(&state.pool, &mount, &secret_path, &key)
+        .await?
+        .ok_or_else(|| ApiError::not_found("secret not found"))?;
 
-    let row = sqlx::query_as::<_, SecretRow>(
-        r#"
-        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at
-        FROM secrets
-        WHERE mount = $1 AND path = $2 AND secret_key = $3
-        "#,
-    )
-    .bind(&mount)
-    .bind(&secret_path)
-    .bind(&key)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::not_found("secret not found"))?;
+    let row = match query.version {
+        Some(version) => {
+            if version <= 0 {
+                return Err(ApiError::bad_request("version must be greater than zero"));
+            }
 
-    let value = state
-        .cipher
-        .decrypt(&CiphertextEnvelope {
-            algorithm: row.cipher_algorithm.clone(),
-            payload: row.encrypted_value.clone(),
-        })
-        .await
-        .map_err(|err| ApiError::internal(format!("decrypt failed: {err}")))?;
+            let row = load_secret_version_row(&state.pool, &mount, &secret_path, &key, version)
+                .await?
+                .ok_or_else(|| ApiError::not_found("secret version not found"))?;
+
+            if row.deleted_at.is_some() {
+                return Err(ApiError::not_found("secret version is deleted"));
+            }
+
+            row
+        }
+        None => {
+            if latest.deleted_at.is_some() {
+                return Err(ApiError::not_found("secret not found"));
+            }
+
+            latest.clone()
+        }
+    };
+
+    let value = decrypt_secret_row(&state, &row).await?;
 
     Ok(Json(SecretReadResponse {
         mount: row.mount,
@@ -392,6 +414,7 @@ async fn read_secret(
         key: row.secret_key,
         value,
         version: row.version,
+        current_version: latest.version,
         updated_at: row.updated_at,
     }))
 }
@@ -413,15 +436,17 @@ async fn write_secret(
 
     let row = sqlx::query_as::<_, SecretRow>(
         r#"
-        INSERT INTO secrets (mount, path, secret_key, encrypted_value, cipher_algorithm)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (mount, path, secret_key)
-        DO UPDATE SET
-            encrypted_value = EXCLUDED.encrypted_value,
-            cipher_algorithm = EXCLUDED.cipher_algorithm,
-            version = secrets.version + 1,
-            updated_at = NOW()
-        RETURNING id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at
+        INSERT INTO secrets (mount, path, secret_key, encrypted_value, cipher_algorithm, version)
+        SELECT
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            COALESCE(MAX(version), 0) + 1
+        FROM secrets
+        WHERE mount = $1 AND path = $2 AND secret_key = $3
+        RETURNING id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
         "#,
     )
     .bind(&mount)
@@ -450,8 +475,17 @@ async fn delete_secret(
 
     let result = sqlx::query(
         r#"
-        DELETE FROM secrets
-        WHERE mount = $1 AND path = $2 AND secret_key = $3
+        WITH latest AS (
+            SELECT id
+            FROM secrets
+            WHERE mount = $1 AND path = $2 AND secret_key = $3
+            ORDER BY version DESC
+            LIMIT 1
+        )
+        UPDATE secrets
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE id IN (SELECT id FROM latest)
+          AND deleted_at IS NULL
         "#,
     )
     .bind(&mount)
@@ -514,6 +548,66 @@ async fn ensure_bootstrap_token(pool: &PgPool, token: &str) -> AnyResult<()> {
     .await?;
 
     Ok(())
+}
+
+async fn load_latest_secret_row(
+    pool: &PgPool,
+    mount: &str,
+    path: &str,
+    key: &str,
+) -> std::result::Result<Option<SecretRow>, ApiError> {
+    sqlx::query_as::<_, SecretRow>(
+        r#"
+        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+        FROM secrets
+        WHERE mount = $1 AND path = $2 AND secret_key = $3
+        ORDER BY version DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(mount)
+    .bind(path)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::from)
+}
+
+async fn load_secret_version_row(
+    pool: &PgPool,
+    mount: &str,
+    path: &str,
+    key: &str,
+    version: i32,
+) -> std::result::Result<Option<SecretRow>, ApiError> {
+    sqlx::query_as::<_, SecretRow>(
+        r#"
+        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+        FROM secrets
+        WHERE mount = $1 AND path = $2 AND secret_key = $3 AND version = $4
+        "#,
+    )
+    .bind(mount)
+    .bind(path)
+    .bind(key)
+    .bind(version)
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::from)
+}
+
+async fn decrypt_secret_row(
+    state: &AppState,
+    row: &SecretRow,
+) -> std::result::Result<String, ApiError> {
+    state
+        .cipher
+        .decrypt(&CiphertextEnvelope {
+            algorithm: row.cipher_algorithm.clone(),
+            payload: row.encrypted_value.clone(),
+        })
+        .await
+        .map_err(|err| ApiError::internal(format!("decrypt failed: {err}")))
 }
 
 async fn load_token_metadata(
