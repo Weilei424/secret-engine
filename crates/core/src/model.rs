@@ -13,6 +13,7 @@ pub struct SecretRecord {
     pub version: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub struct SecretMetadata {
     pub path: String,
     pub key: String,
     pub version: i32,
+    pub current_version: i32,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -44,6 +46,7 @@ pub struct SecretReadResponse {
     pub key: String,
     pub value: String,
     pub version: i32,
+    pub current_version: i32,
     pub updated_at: DateTime<Utc>,
 }
 
