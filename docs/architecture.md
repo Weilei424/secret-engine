@@ -80,11 +80,11 @@ The design goal is to keep the initial system simple while leaving room for stro
 - `GET /api/v1/kv/:mount`
   - Lists secrets for a mount, optionally filtered by `prefix`.
 - `GET /api/v1/kv/:mount/*path`
-  - Reads a single secret.
+  - Reads the current secret version by default, or a specific version when `?version=<n>` is supplied.
 - `POST /api/v1/kv/:mount/*path`
-  - Writes or updates a single secret.
+  - Writes a new current version for a single secret.
 - `DELETE /api/v1/kv/:mount/*path`
-  - Deletes a single secret.
+  - Soft-deletes the current secret version.
 
 The current path convention treats the final path segment as the key and the preceding segments as the logical path. Example:
 
@@ -95,7 +95,7 @@ The current path convention treats the final path segment as the key and the pre
 
 ## Persistence model
 
-The current PostgreSQL schema stores:
+The current PostgreSQL schema stores versioned secret rows with:
 
 - `mount`
 - `path`
@@ -103,9 +103,10 @@ The current PostgreSQL schema stores:
 - `encrypted_value`
 - `cipher_algorithm`
 - `version`
+- `deleted_at` for soft-deleted current versions
 - timestamps
 
-The combination of `mount + path + secret_key` is unique.
+The combination of `mount + path + secret_key + version` is unique.
 
 This schema is intentionally narrow. It supports the current KV use case and keeps future upgrades straightforward:
 
