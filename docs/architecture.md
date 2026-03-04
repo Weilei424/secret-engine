@@ -79,6 +79,12 @@ The design goal is to keep the initial system simple while leaving room for stro
 
 - `GET /api/v1/kv/:mount`
   - Lists secrets for a mount, optionally filtered by `prefix`.
+- `GET /api/v1/kv/:mount/metadata/*path`
+  - Returns per-version metadata for a single secret.
+- `POST /api/v1/kv/:mount/undelete/*path`
+  - Clears soft-delete markers for the requested versions.
+- `POST /api/v1/kv/:mount/destroy/*path`
+  - Permanently removes the requested versions.
 - `GET /api/v1/kv/:mount/*path`
   - Reads the current secret version by default, or a specific version when `?version=<n>` is supplied.
 - `POST /api/v1/kv/:mount/*path`
@@ -107,6 +113,8 @@ The current PostgreSQL schema stores versioned secret rows with:
 - timestamps
 
 The combination of `mount + path + secret_key + version` is unique.
+
+Destroyed versions are removed permanently. The current schema does not keep a separate tombstone record after destroy.
 
 This schema is intentionally narrow. It supports the current KV use case and keeps future upgrades straightforward:
 

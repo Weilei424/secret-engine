@@ -40,6 +40,9 @@ secretsctl status
 secretsctl kv put apps/demo/password super-secret
 secretsctl kv get apps/demo/password
 secretsctl kv get --version 1 apps/demo/password
+secretsctl kv metadata apps/demo/password
+secretsctl kv undelete --version 2 apps/demo/password
+secretsctl kv destroy --version 1 apps/demo/password
 secretsctl kv list --prefix apps/
 secretsctl kv delete apps/demo/password
 ```
@@ -69,7 +72,7 @@ Use the returned token as the bearer credential for subsequent API calls.
 
 - Single bootstrap admin token.
 - Vault-like KV pathing (`/api/v1/kv/<mount>/<path>/<key>`).
-- Versioned KV storage with soft delete of the current version.
+- Versioned KV storage with metadata, soft delete, undelete, and destroy flows.
 - AES-256-GCM encryption with an Argon2id-derived master key for new writes.
 - Encryption is isolated behind a trait so it can be replaced later with a stronger key-management model.
 
