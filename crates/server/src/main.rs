@@ -12,9 +12,9 @@ use config::{Config, Environment};
 use secret_engine_core::{
     crypto::{AesGcmCipher, CiphertextEnvelope, SecretCipher},
     model::{
-        SecretListResponse, SecretMetadata, SecretReadResponse, SecretWriteRequest,
-        SecretWriteResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse,
-        TokenMetadata, TokenScope,
+        SecretListResponse, SecretMetadata, SecretMetadataResponse, SecretReadResponse,
+        SecretVersionActionRequest, SecretVersionMetadata, SecretWriteRequest, SecretWriteResponse,
+        TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata, TokenScope,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -171,6 +171,18 @@ async fn main() -> AnyResult<()> {
             axum::routing::delete(delete_token),
         )
         .route("/api/v1/kv/:mount", get(list_secrets))
+        .route(
+            "/api/v1/kv/:mount/metadata/*path",
+            get(read_secret_metadata),
+        )
+        .route(
+            "/api/v1/kv/:mount/undelete/*path",
+            axum::routing::post(undelete_secret),
+        )
+        .route(
+            "/api/v1/kv/:mount/destroy/*path",
+            axum::routing::post(destroy_secret),
+        )
         .route(
             "/api/v1/kv/:mount/*path",
             get(read_secret).post(write_secret).delete(delete_secret),
@@ -419,6 +431,45 @@ async fn read_secret(
     }))
 }
 
+async fn read_secret_metadata(
+    headers: HeaderMap,
+    Path((mount, path)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<SecretMetadataResponse>, ApiError> {
+    let (secret_path, key) = split_secret_path(&path)?;
+    authorize_path(&headers, &state, &mount, &secret_path).await?;
+
+    let rows = load_all_secret_versions(&state.pool, &mount, &secret_path, &key).await?;
+    if rows.is_empty() {
+        return Err(ApiError::not_found("secret not found"));
+    }
+
+    let latest_version = rows[0].version;
+    let current_version = if rows[0].deleted_at.is_none() {
+        Some(rows[0].version)
+    } else {
+        None
+    };
+    let versions = rows
+        .into_iter()
+        .map(|row| SecretVersionMetadata {
+            version: row.version,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            deleted_at: row.deleted_at,
+        })
+        .collect();
+
+    Ok(Json(SecretMetadataResponse {
+        mount,
+        path: secret_path,
+        key,
+        latest_version,
+        current_version,
+        versions,
+    }))
+}
+
 async fn write_secret(
     headers: HeaderMap,
     Path((mount, path)): Path<(String, String)>,
@@ -497,6 +548,70 @@ async fn delete_secret(
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("secret not found"));
     }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn undelete_secret(
+    headers: HeaderMap,
+    Path((mount, path)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(payload): Json<SecretVersionActionRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let (secret_path, key) = split_secret_path(&path)?;
+    authorize_path(&headers, &state, &mount, &secret_path).await?;
+    let versions = normalize_requested_versions(payload.versions)?;
+
+    ensure_secret_versions_exist(&state.pool, &mount, &secret_path, &key, &versions).await?;
+
+    sqlx::query(
+        r#"
+        UPDATE secrets
+        SET deleted_at = NULL, updated_at = NOW()
+        WHERE mount = $1
+          AND path = $2
+          AND secret_key = $3
+          AND version = ANY($4)
+          AND deleted_at IS NOT NULL
+        "#,
+    )
+    .bind(&mount)
+    .bind(&secret_path)
+    .bind(&key)
+    .bind(&versions)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn destroy_secret(
+    headers: HeaderMap,
+    Path((mount, path)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(payload): Json<SecretVersionActionRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let (secret_path, key) = split_secret_path(&path)?;
+    authorize_path(&headers, &state, &mount, &secret_path).await?;
+    let versions = normalize_requested_versions(payload.versions)?;
+
+    ensure_secret_versions_exist(&state.pool, &mount, &secret_path, &key, &versions).await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM secrets
+        WHERE mount = $1
+          AND path = $2
+          AND secret_key = $3
+          AND version = ANY($4)
+        "#,
+    )
+    .bind(&mount)
+    .bind(&secret_path)
+    .bind(&key)
+    .bind(&versions)
+    .execute(&state.pool)
+    .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -596,6 +711,28 @@ async fn load_secret_version_row(
     .map_err(ApiError::from)
 }
 
+async fn load_all_secret_versions(
+    pool: &PgPool,
+    mount: &str,
+    path: &str,
+    key: &str,
+) -> std::result::Result<Vec<SecretRow>, ApiError> {
+    sqlx::query_as::<_, SecretRow>(
+        r#"
+        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+        FROM secrets
+        WHERE mount = $1 AND path = $2 AND secret_key = $3
+        ORDER BY version DESC
+        "#,
+    )
+    .bind(mount)
+    .bind(path)
+    .bind(key)
+    .fetch_all(pool)
+    .await
+    .map_err(ApiError::from)
+}
+
 async fn decrypt_secret_row(
     state: &AppState,
     row: &SecretRow,
@@ -608,6 +745,37 @@ async fn decrypt_secret_row(
         })
         .await
         .map_err(|err| ApiError::internal(format!("decrypt failed: {err}")))
+}
+
+async fn ensure_secret_versions_exist(
+    pool: &PgPool,
+    mount: &str,
+    path: &str,
+    key: &str,
+    versions: &[i32],
+) -> std::result::Result<(), ApiError> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM secrets
+        WHERE mount = $1
+          AND path = $2
+          AND secret_key = $3
+          AND version = ANY($4)
+        "#,
+    )
+    .bind(mount)
+    .bind(path)
+    .bind(key)
+    .bind(versions.to_vec())
+    .fetch_one(pool)
+    .await?;
+
+    if count != versions.len() as i64 {
+        return Err(ApiError::not_found("secret version not found"));
+    }
+
+    Ok(())
 }
 
 async fn load_token_metadata(
@@ -746,6 +914,21 @@ fn split_secret_path(raw: &str) -> std::result::Result<(String, String), ApiErro
 
 fn normalize_path_prefix(value: &str) -> String {
     value.trim_matches('/').to_string()
+}
+
+fn normalize_requested_versions(values: Vec<i32>) -> std::result::Result<Vec<i32>, ApiError> {
+    if values.is_empty() {
+        return Err(ApiError::bad_request("at least one version is required"));
+    }
+
+    let mut versions = values;
+    if versions.iter().any(|version| *version <= 0) {
+        return Err(ApiError::bad_request("version must be greater than zero"));
+    }
+
+    versions.sort_unstable();
+    versions.dedup();
+    Ok(versions)
 }
 
 fn hash_token(token: &str) -> String {
