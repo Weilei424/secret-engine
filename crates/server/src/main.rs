@@ -1006,8 +1006,21 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::split_secret_path;
-    use axum::http::StatusCode;
+    use super::{
+        AppState, ListQuery, ReadQuery, SecretVersionActionRequest, SecretWriteRequest,
+        authorize_path, delete_secret, destroy_secret, hash_token, list_secrets,
+        normalize_path_prefix, normalize_requested_versions, read_secret, read_secret_metadata,
+        split_secret_path, undelete_secret, write_secret,
+    };
+    use axum::{
+        Json,
+        extract::{Path, Query, State},
+        http::{HeaderMap, HeaderValue, StatusCode, header},
+    };
+    use secret_engine_core::crypto::AesGcmCipher;
+    use sqlx::PgPool;
+    use std::sync::Arc;
+    use uuid::Uuid;
 
     #[test]
     fn split_secret_path_supports_nested_paths() {
@@ -1028,5 +1041,247 @@ mod tests {
         let error = split_secret_path("/").expect_err("empty path should fail");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(error.message, "secret path cannot be empty");
+    }
+
+    #[test]
+    fn normalize_path_prefix_trims_slashes() {
+        assert_eq!(normalize_path_prefix("/apps/demo/"), "apps/demo");
+        assert_eq!(normalize_path_prefix("///"), "");
+    }
+
+    #[test]
+    fn normalize_requested_versions_sorts_and_deduplicates() {
+        let versions = normalize_requested_versions(vec![3, 1, 3, 2]).expect("versions valid");
+        assert_eq!(versions, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn normalize_requested_versions_rejects_invalid_values() {
+        let empty = normalize_requested_versions(vec![]).expect_err("empty should fail");
+        assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+
+        let non_positive = normalize_requested_versions(vec![1, 0]).expect_err("0 should fail");
+        assert_eq!(non_positive.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn kv_version_lifecycle(pool: PgPool) {
+        let state = test_state(pool);
+        let headers = admin_headers(&state.pool).await;
+        let mount = "kv".to_string();
+        let secret = "apps/demo/password".to_string();
+
+        let first = write_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            State(state.clone()),
+            Json(SecretWriteRequest {
+                value: "value-v1".to_string(),
+            }),
+        )
+        .await
+        .expect("first write");
+        assert_eq!(first.0.version, 1);
+
+        let second = write_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            State(state.clone()),
+            Json(SecretWriteRequest {
+                value: "value-v2".to_string(),
+            }),
+        )
+        .await
+        .expect("second write");
+        assert_eq!(second.0.version, 2);
+
+        let latest = read_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            Query(ReadQuery { version: None }),
+            State(state.clone()),
+        )
+        .await
+        .expect("read latest");
+        assert_eq!(latest.0.value, "value-v2");
+        assert_eq!(latest.0.version, 2);
+        assert_eq!(latest.0.current_version, 2);
+
+        let historical = read_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            Query(ReadQuery { version: Some(1) }),
+            State(state.clone()),
+        )
+        .await
+        .expect("read historical");
+        assert_eq!(historical.0.value, "value-v1");
+        assert_eq!(historical.0.version, 1);
+        assert_eq!(historical.0.current_version, 2);
+
+        let listed = list_secrets(
+            headers.clone(),
+            Path(mount.clone()),
+            Query(ListQuery {
+                prefix: Some("apps/".to_string()),
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("list secrets");
+        assert_eq!(listed.0.items.len(), 1);
+        assert_eq!(listed.0.items[0].version, 2);
+
+        delete_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            State(state.clone()),
+        )
+        .await
+        .expect("delete latest");
+
+        let deleted_read = read_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            Query(ReadQuery { version: None }),
+            State(state.clone()),
+        )
+        .await
+        .expect_err("deleted secret should not read");
+        assert_eq!(deleted_read.status, StatusCode::NOT_FOUND);
+
+        let metadata = read_secret_metadata(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            State(state.clone()),
+        )
+        .await
+        .expect("read metadata");
+        assert_eq!(metadata.0.latest_version, 2);
+        assert_eq!(metadata.0.current_version, None);
+
+        undelete_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            State(state.clone()),
+            Json(SecretVersionActionRequest { versions: vec![2] }),
+        )
+        .await
+        .expect("undelete version");
+
+        let restored = read_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            Query(ReadQuery { version: None }),
+            State(state.clone()),
+        )
+        .await
+        .expect("restored read");
+        assert_eq!(restored.0.value, "value-v2");
+
+        destroy_secret(
+            headers,
+            Path((mount.clone(), secret.clone())),
+            State(state.clone()),
+            Json(SecretVersionActionRequest { versions: vec![1] }),
+        )
+        .await
+        .expect("destroy historical");
+
+        let metadata_after_destroy = read_secret_metadata(
+            admin_headers(&state.pool).await,
+            Path((mount.clone(), secret.clone())),
+            State(state.clone()),
+        )
+        .await
+        .expect("metadata after destroy");
+        assert!(
+            metadata_after_destroy
+                .0
+                .versions
+                .iter()
+                .all(|v| v.version != 1)
+        );
+
+        let destroyed_read = read_secret(
+            admin_headers(&state.pool).await,
+            Path((mount, secret)),
+            Query(ReadQuery { version: Some(1) }),
+            State(state),
+        )
+        .await
+        .expect_err("destroyed version should not read");
+        assert_eq!(destroyed_read.status, StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn authorize_path_enforces_token_scope(pool: PgPool) {
+        let state = test_state(pool.clone());
+
+        let token_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO service_tokens (id, label, token_hash, is_admin)
+            VALUES ($1, $2, $3, FALSE)
+            "#,
+        )
+        .bind(token_id)
+        .bind("scoped-token")
+        .bind(hash_token("scoped"))
+        .execute(&pool)
+        .await
+        .expect("insert scoped token");
+
+        sqlx::query(
+            r#"
+            INSERT INTO service_token_policies (token_id, mount, path_prefix)
+            VALUES ($1, 'kv', 'apps/demo')
+            "#,
+        )
+        .bind(token_id)
+        .execute(&pool)
+        .await
+        .expect("insert policy");
+
+        let headers = bearer_headers("scoped");
+        authorize_path(&headers, &state, "kv", "apps/demo/feature")
+            .await
+            .expect("path should be allowed");
+
+        let denied = authorize_path(&headers, &state, "kv", "apps/prod")
+            .await
+            .expect_err("path should be denied");
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    }
+
+    fn test_state(pool: PgPool) -> AppState {
+        AppState {
+            pool,
+            cipher: Arc::new(AesGcmCipher::from_passphrase("test-master-key").expect("cipher")),
+        }
+    }
+
+    async fn admin_headers(pool: &PgPool) -> HeaderMap {
+        sqlx::query(
+            r#"
+            INSERT INTO service_tokens (id, label, token_hash, is_admin)
+            VALUES ($1, $2, $3, TRUE)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind("admin-token")
+        .bind(hash_token("admin"))
+        .execute(pool)
+        .await
+        .expect("insert admin token");
+
+        bearer_headers("admin")
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let value = HeaderValue::from_str(&format!("Bearer {token}")).expect("header");
+        headers.insert(header::AUTHORIZATION, value);
+        headers
     }
 }
