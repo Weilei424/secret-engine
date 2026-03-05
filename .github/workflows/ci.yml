@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: secret
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: secret_engine
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U secret -d secret_engine"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://secret:secret@localhost:5432/secret_engine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo fmt check
+        run: cargo fmt --all --check
+
+      - name: Cargo check workspace
+        run: cargo check --workspace
+
+      - name: Cargo test workspace
+        run: cargo test --workspace
