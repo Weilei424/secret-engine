@@ -485,6 +485,15 @@ async fn write_secret(
         .await
         .map_err(|err| ApiError::internal(format!("encrypt failed: {err}")))?;
 
+    let mut tx = state.pool.begin().await?;
+    // Serialize version allocation per logical secret to avoid duplicate version races.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || '|' || $2 || '|' || $3))")
+        .bind(&mount)
+        .bind(&secret_path)
+        .bind(&key)
+        .execute(&mut *tx)
+        .await?;
+
     let row = sqlx::query_as::<_, SecretRow>(
         r#"
         INSERT INTO secrets (mount, path, secret_key, encrypted_value, cipher_algorithm, version)
@@ -505,8 +514,9 @@ async fn write_secret(
     .bind(&key)
     .bind(&encrypted.payload)
     .bind(&encrypted.algorithm)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(Json(SecretWriteResponse {
         mount: row.mount,
@@ -936,6 +946,7 @@ fn hash_token(token: &str) -> String {
     format!("{digest:x}")
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
