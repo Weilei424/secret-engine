@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use reqwest::{Client, Method, StatusCode};
 use secret_engine_core::model::{
     SecretListResponse, SecretMetadataResponse, SecretReadResponse, SecretVersionActionRequest,
-    SecretWriteRequest, SecretWriteResponse,
+    SecretWriteRequest, SecretWriteResponse, SystemInitResponse, SystemInitStatusResponse,
 };
 use url::Url;
 
@@ -30,10 +30,20 @@ struct Cli {
 enum Commands {
     Login(LoginArgs),
     Status,
+    Sys {
+        #[command(subcommand)]
+        command: SysCommand,
+    },
     Kv {
         #[command(subcommand)]
         command: KvCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SysCommand {
+    Init,
+    Status,
 }
 
 #[derive(Debug, Args)]
@@ -104,6 +114,10 @@ async fn main() -> Result<()> {
             println!("export SECRET_ENGINE_TOKEN={}", args.token);
         }
         Commands::Status => api.status().await?,
+        Commands::Sys { command } => match command {
+            SysCommand::Init => api.sys_init().await?,
+            SysCommand::Status => api.sys_status().await?,
+        },
         Commands::Kv { command } => match command {
             KvCommand::Put(args) => api.kv_put(args).await?,
             KvCommand::Get(args) => api.kv_get(args).await?,
@@ -139,6 +153,34 @@ impl Api {
             bail!("server status check failed: {}", response.status());
         }
         println!("server ok");
+        Ok(())
+    }
+
+    async fn sys_init(&self) -> Result<()> {
+        let response: SystemInitResponse = self
+            .send::<()>(Method::POST, "/api/v1/sys/init", None)
+            .await?
+            .json()
+            .await?;
+
+        println!("system initialized at {}", response.initialized_at);
+        println!("root token: {}", response.root_token);
+        println!("export SECRET_ENGINE_TOKEN={}", response.root_token);
+        Ok(())
+    }
+
+    async fn sys_status(&self) -> Result<()> {
+        let response: SystemInitStatusResponse = self
+            .send::<()>(Method::GET, "/api/v1/sys/init", None)
+            .await?
+            .json()
+            .await?;
+
+        if let Some(initialized_at) = response.initialized_at {
+            println!("initialized=true at {initialized_at}");
+        } else {
+            println!("initialized=false");
+        }
         Ok(())
     }
 
