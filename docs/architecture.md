@@ -72,6 +72,16 @@ The design goal is to keep the initial system simple while leaving room for stro
 
 ### Auth
 
+- `GET /api/v1/sys/init`
+  - Returns initialization status.
+- `POST /api/v1/sys/init`
+  - Performs one-time initialization and returns root token + recovery key.
+- `POST /api/v1/sys/root/rotate`
+  - Rotates root token and recovery key.
+- `POST /api/v1/sys/root/revoke`
+  - Revokes current root token.
+- `POST /api/v1/sys/root/recover`
+  - Recovers root token using recovery key.
 - `GET /api/v1/auth/validate`
   - Confirms that the supplied bearer token is accepted.
 

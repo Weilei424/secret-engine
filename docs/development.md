@@ -90,6 +90,9 @@ export SECRET_ENGINE_TOKEN=REPLACE_WITH_ROOT_TOKEN
 
 cargo run -p secret-engine-cli -- status
 cargo run -p secret-engine-cli -- sys status
+cargo run -p secret-engine-cli -- sys root rotate
+cargo run -p secret-engine-cli -- sys root revoke
+cargo run -p secret-engine-cli -- sys root recover --recovery-key REPLACE_WITH_RECOVERY_KEY
 cargo run -p secret-engine-cli -- kv put apps/demo/password super-secret
 cargo run -p secret-engine-cli -- kv get apps/demo/password
 cargo run -p secret-engine-cli -- kv list --prefix apps/
