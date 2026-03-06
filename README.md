@@ -22,7 +22,11 @@
 
 2. Open the UI at `http://localhost:3000`.
 3. Use the API at `http://localhost:8080`.
-4. Use the default bootstrap token `dev-root-token`.
+4. Initialize once and export the generated root token:
+
+   ```bash
+   cargo run -p secret-engine-cli -- sys init
+   ```
 
 The API only accepts browser requests from configured origins. For local development, the default allowlist is `http://localhost:3000` and `http://127.0.0.1:3000`.
 
@@ -34,9 +38,10 @@ This repository is configured to place Cargo build artifacts in `/tmp/secret-eng
 
 ```bash
 export SECRET_ENGINE_ADDR=http://127.0.0.1:8080
-export SECRET_ENGINE_TOKEN=dev-root-token
+export SECRET_ENGINE_TOKEN=REPLACE_WITH_ROOT_TOKEN
 
 secretsctl status
+secretsctl sys status
 secretsctl kv put apps/demo/password super-secret
 secretsctl kv get apps/demo/password
 secretsctl kv get --version 1 apps/demo/password
@@ -49,13 +54,23 @@ secretsctl kv delete apps/demo/password
 
 ## Token management
 
-On startup, the configured `SECRET_ENGINE__ADMIN_TOKEN` is seeded into the database as the bootstrap admin token.
+Initialize the server once to mint a root token:
+
+```bash
+secretsctl sys init
+```
+
+Then validate initialization state any time with:
+
+```bash
+secretsctl sys status
+```
 
 You can mint a scoped service token with:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/v1/tokens \
-  -H 'Authorization: Bearer dev-root-token' \
+  -H 'Authorization: Bearer REPLACE_WITH_ROOT_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{
     "label": "demo-reader",
@@ -70,7 +85,7 @@ Use the returned token as the bearer credential for subsequent API calls.
 
 ## Current scope
 
-- Single bootstrap admin token.
+- Explicit one-time init flow that returns a root token.
 - Vault-like KV pathing (`/api/v1/kv/<mount>/<path>/<key>`).
 - Versioned KV storage with metadata, soft delete, undelete, and destroy flows.
 - AES-256-GCM encryption with an Argon2id-derived master key for new writes.
