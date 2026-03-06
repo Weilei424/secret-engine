@@ -114,3 +114,15 @@ pub struct TokenCreateResponse {
 pub struct TokenListResponse {
     pub items: Vec<TokenMetadata>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemInitStatusResponse {
+    pub initialized: bool,
+    pub initialized_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemInitResponse {
+    pub root_token: String,
+    pub initialized_at: DateTime<Utc>,
+}
