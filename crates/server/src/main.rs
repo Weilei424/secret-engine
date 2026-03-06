@@ -1641,6 +1641,7 @@ mod tests {
 
     async fn admin_headers(pool: &PgPool) -> HeaderMap {
         mark_initialized(pool).await;
+        let token = format!("admin-{}", Uuid::new_v4().simple());
 
         sqlx::query(
             r#"
@@ -1650,12 +1651,12 @@ mod tests {
         )
         .bind(Uuid::new_v4())
         .bind("admin-token")
-        .bind(hash_token("admin"))
+        .bind(hash_token(&token))
         .execute(pool)
         .await
         .expect("insert admin token");
 
-        bearer_headers("admin")
+        bearer_headers(&token)
     }
 
     async fn mark_initialized(pool: &PgPool) {
