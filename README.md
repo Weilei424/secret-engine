@@ -42,6 +42,9 @@ export SECRET_ENGINE_TOKEN=REPLACE_WITH_ROOT_TOKEN
 
 secretsctl status
 secretsctl sys status
+secretsctl sys root rotate
+secretsctl sys root revoke
+secretsctl sys root recover --recovery-key REPLACE_WITH_RECOVERY_KEY
 secretsctl kv put apps/demo/password super-secret
 secretsctl kv get apps/demo/password
 secretsctl kv get --version 1 apps/demo/password
@@ -64,6 +67,19 @@ Then validate initialization state any time with:
 
 ```bash
 secretsctl sys status
+```
+
+Root lifecycle commands:
+
+```bash
+# rotate root + recovery key (requires current root token)
+secretsctl sys root rotate
+
+# revoke current root token (requires current root token)
+secretsctl sys root revoke
+
+# recover root after revoke/loss (uses recovery key, no token required)
+secretsctl sys root recover --recovery-key REPLACE_WITH_RECOVERY_KEY
 ```
 
 You can mint a scoped service token with:
