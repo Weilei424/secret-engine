@@ -3,8 +3,10 @@ use std::{net::SocketAddr, sync::Arc};
 use anyhow::{Context, Result as AnyResult};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header},
+    middleware::{Next, from_fn},
     response::IntoResponse,
     routing::get,
 };
@@ -25,6 +27,8 @@ use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use uuid::Uuid;
+
+const REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Debug, Clone, Deserialize)]
 struct Settings {
@@ -201,6 +205,7 @@ async fn main() -> AnyResult<()> {
             get(read_secret).post(write_secret).delete(delete_secret),
         )
         .with_state(state)
+        .layer(from_fn(request_id_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
@@ -217,6 +222,38 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+async fn request_id_middleware(req: Request<Body>, next: Next) -> impl IntoResponse {
+    let mut req = req;
+    let request_id = req
+        .headers()
+        .get(request_id_header())
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        req.headers_mut().insert(request_id_header(), value);
+    }
+
+    info!(
+        request_id = %request_id,
+        method = %req.method(),
+        path = %req.uri().path(),
+        "request started"
+    );
+    let mut response = next.run(req).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(request_id_header(), value);
+    }
+    info!(
+        request_id = %request_id,
+        status = response.status().as_u16(),
+        "request completed"
+    );
+    response
+}
+
 fn build_cors_layer(settings: &Settings) -> AnyResult<CorsLayer> {
     let allowed_origins = settings
         .allowed_origins
@@ -231,15 +268,55 @@ fn build_cors_layer(settings: &Settings) -> AnyResult<CorsLayer> {
     Ok(CorsLayer::new()
         .allow_origin(allowed_origins)
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]))
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            request_id_header(),
+        ]))
 }
 
 async fn validate_token(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> std::result::Result<StatusCode, ApiError> {
-    authenticate(&headers, &state).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let request_id = request_id_from_headers(&headers);
+    let auth = authenticate(&headers, &state).await;
+    match auth {
+        Ok(auth) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "auth.validate",
+                None,
+                None,
+                None,
+                true,
+                StatusCode::NO_CONTENT,
+                None,
+                serde_json::json!({}),
+            )
+            .await?;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "auth.validate",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn read_system_init_status(
@@ -461,25 +538,86 @@ async fn list_tokens(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> std::result::Result<Json<TokenListResponse>, ApiError> {
-    authorize_admin(&headers, &state).await?;
+    let request_id = request_id_from_headers(&headers);
+    let auth = authorize_admin(&headers, &state).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "token.list",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
 
-    let rows = sqlx::query_as::<_, ServiceTokenRow>(
-        r#"
-        SELECT id, label, is_admin, expires_at, created_at, updated_at
-        FROM service_tokens
-        ORDER BY created_at ASC
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await?;
+    let result: std::result::Result<Json<TokenListResponse>, ApiError> = async {
+        let rows = sqlx::query_as::<_, ServiceTokenRow>(
+            r#"
+            SELECT id, label, is_admin, expires_at, created_at, updated_at
+            FROM service_tokens
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(&state.pool)
+        .await?;
 
-    let mut items = Vec::with_capacity(rows.len());
-    for row in rows {
-        let metadata = load_token_metadata(&state.pool, row).await?;
-        items.push(metadata);
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let metadata = load_token_metadata(&state.pool, row).await?;
+            items.push(metadata);
+        }
+
+        Ok(Json(TokenListResponse { items }))
     }
+    .await;
 
-    Ok(Json(TokenListResponse { items }))
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "token.list",
+                None,
+                None,
+                None,
+                true,
+                StatusCode::OK,
+                None,
+                serde_json::json!({}),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "token.list",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn create_token(
@@ -487,7 +625,28 @@ async fn create_token(
     State(state): State<AppState>,
     Json(payload): Json<TokenCreateRequest>,
 ) -> std::result::Result<Json<TokenCreateResponse>, ApiError> {
-    authorize_admin(&headers, &state).await?;
+    let request_id = request_id_from_headers(&headers);
+    let auth = authorize_admin(&headers, &state).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "token.create",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
 
     let TokenCreateRequest {
         label,
@@ -496,79 +655,122 @@ async fn create_token(
         scopes: requested_scopes,
     } = payload;
 
-    if label.trim().is_empty() {
-        return Err(ApiError::bad_request("token label cannot be empty"));
-    }
-
-    if !admin && requested_scopes.is_empty() {
-        return Err(ApiError::bad_request(
-            "non-admin tokens require at least one scope",
-        ));
-    }
-
-    let mut scopes = Vec::with_capacity(requested_scopes.len());
-    for scope in requested_scopes {
-        let mount = scope.mount.trim().to_string();
-        if mount.is_empty() {
-            return Err(ApiError::bad_request("token scope mount cannot be empty"));
+    let result: std::result::Result<Json<TokenCreateResponse>, ApiError> = async {
+        if label.trim().is_empty() {
+            return Err(ApiError::bad_request("token label cannot be empty"));
         }
 
-        scopes.push(TokenScope {
-            mount,
-            path_prefix: normalize_path_prefix(&scope.path_prefix),
-        });
-    }
+        if !admin && requested_scopes.is_empty() {
+            return Err(ApiError::bad_request(
+                "non-admin tokens require at least one scope",
+            ));
+        }
 
-    let plain_token = format!("se_{}", Uuid::new_v4().simple());
-    let token_hash = hash_token(&plain_token);
-    let token_id = Uuid::new_v4();
+        let mut scopes = Vec::with_capacity(requested_scopes.len());
+        for scope in requested_scopes {
+            let mount = scope.mount.trim().to_string();
+            if mount.is_empty() {
+                return Err(ApiError::bad_request("token scope mount cannot be empty"));
+            }
 
-    sqlx::query(
-        r#"
-        INSERT INTO service_tokens (id, label, token_hash, is_admin, expires_at)
-        VALUES ($1, $2, $3, $4, $5)
-        "#,
-    )
-    .bind(token_id)
-    .bind(label.trim())
-    .bind(token_hash)
-    .bind(admin)
-    .bind(expires_at)
-    .execute(&state.pool)
-    .await?;
+            scopes.push(TokenScope {
+                mount,
+                path_prefix: normalize_path_prefix(&scope.path_prefix),
+            });
+        }
 
-    for scope in &scopes {
+        let plain_token = format!("se_{}", Uuid::new_v4().simple());
+        let token_hash = hash_token(&plain_token);
+        let token_id = Uuid::new_v4();
+
         sqlx::query(
             r#"
-            INSERT INTO service_token_policies (token_id, mount, path_prefix)
-            VALUES ($1, $2, $3)
-            ON CONFLICT DO NOTHING
+            INSERT INTO service_tokens (id, label, token_hash, is_admin, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(token_id)
-        .bind(&scope.mount)
-        .bind(&scope.path_prefix)
+        .bind(label.trim())
+        .bind(token_hash)
+        .bind(admin)
+        .bind(expires_at)
         .execute(&state.pool)
         .await?;
+
+        for scope in &scopes {
+            sqlx::query(
+                r#"
+                INSERT INTO service_token_policies (token_id, mount, path_prefix)
+                VALUES ($1, $2, $3)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(token_id)
+            .bind(&scope.mount)
+            .bind(&scope.path_prefix)
+            .execute(&state.pool)
+            .await?;
+        }
+
+        let row = sqlx::query_as::<_, ServiceTokenRow>(
+            r#"
+            SELECT id, label, is_admin, expires_at, created_at, updated_at
+            FROM service_tokens
+            WHERE id = $1
+            "#,
+        )
+        .bind(token_id)
+        .fetch_one(&state.pool)
+        .await?;
+
+        let metadata = load_token_metadata(&state.pool, row).await?;
+
+        Ok(Json(TokenCreateResponse {
+            token: plain_token,
+            metadata,
+        }))
     }
+    .await;
 
-    let row = sqlx::query_as::<_, ServiceTokenRow>(
-        r#"
-        SELECT id, label, is_admin, expires_at, created_at, updated_at
-        FROM service_tokens
-        WHERE id = $1
-        "#,
-    )
-    .bind(token_id)
-    .fetch_one(&state.pool)
-    .await?;
-
-    let metadata = load_token_metadata(&state.pool, row).await?;
-
-    Ok(Json(TokenCreateResponse {
-        token: plain_token,
-        metadata,
-    }))
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "token.create",
+                None,
+                None,
+                None,
+                true,
+                StatusCode::OK,
+                None,
+                serde_json::json!({
+                    "created_token_id": response.0.metadata.id,
+                    "created_token_admin": response.0.metadata.admin,
+                }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "token.create",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn list_secrets(
@@ -577,8 +779,29 @@ async fn list_secrets(
     Query(query): Query<ListQuery>,
     State(state): State<AppState>,
 ) -> std::result::Result<Json<SecretListResponse>, ApiError> {
+    let request_id = request_id_from_headers(&headers);
     let prefix = normalize_path_prefix(query.prefix.as_deref().unwrap_or_default());
-    authorize_path(&headers, &state, &mount, &prefix).await?;
+    let auth = authorize_path(&headers, &state, &mount, &prefix).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "kv.list",
+                Some(&mount),
+                Some(&prefix),
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
 
     let like_value = if prefix.is_empty() {
         "%".to_string()
@@ -586,27 +809,67 @@ async fn list_secrets(
         format!("{prefix}%")
     };
 
-    let rows = sqlx::query_as::<_, SecretRow>(
-        r#"
-        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
-        FROM (
-            SELECT DISTINCT ON (mount, path, secret_key)
-                id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
-            FROM secrets
-            WHERE mount = $1 AND path LIKE $2
-            ORDER BY mount, path, secret_key, version DESC
-        ) AS current_secrets
-        WHERE deleted_at IS NULL
-        ORDER BY path ASC, secret_key ASC
-        "#,
-    )
-    .bind(&mount)
-    .bind(&like_value)
-    .fetch_all(&state.pool)
-    .await?;
+    let result: std::result::Result<Json<SecretListResponse>, ApiError> = async {
+        let rows = sqlx::query_as::<_, SecretRow>(
+            r#"
+            SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+            FROM (
+                SELECT DISTINCT ON (mount, path, secret_key)
+                    id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+                FROM secrets
+                WHERE mount = $1 AND path LIKE $2
+                ORDER BY mount, path, secret_key, version DESC
+            ) AS current_secrets
+            WHERE deleted_at IS NULL
+            ORDER BY path ASC, secret_key ASC
+            "#,
+        )
+        .bind(&mount)
+        .bind(&like_value)
+        .fetch_all(&state.pool)
+        .await?;
 
-    let items = rows.into_iter().map(SecretMetadata::from).collect();
-    Ok(Json(SecretListResponse { items }))
+        let items = rows.into_iter().map(SecretMetadata::from).collect();
+        Ok(Json(SecretListResponse { items }))
+    }
+    .await;
+
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.list",
+                Some(&mount),
+                Some(&prefix),
+                None,
+                true,
+                StatusCode::OK,
+                None,
+                serde_json::json!({ "item_count": response.0.items.len() }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.list",
+                Some(&mount),
+                Some(&prefix),
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn read_secret(
@@ -615,48 +878,110 @@ async fn read_secret(
     Query(query): Query<ReadQuery>,
     State(state): State<AppState>,
 ) -> std::result::Result<Json<SecretReadResponse>, ApiError> {
+    let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    authorize_path(&headers, &state, &mount, &secret_path).await?;
-    let latest = load_latest_secret_row(&state.pool, &mount, &secret_path, &key)
-        .await?
-        .ok_or_else(|| ApiError::not_found("secret not found"))?;
-
-    let row = match query.version {
-        Some(version) => {
-            if version <= 0 {
-                return Err(ApiError::bad_request("version must be greater than zero"));
-            }
-
-            let row = load_secret_version_row(&state.pool, &mount, &secret_path, &key, version)
-                .await?
-                .ok_or_else(|| ApiError::not_found("secret version not found"))?;
-
-            if row.deleted_at.is_some() {
-                return Err(ApiError::not_found("secret version is deleted"));
-            }
-
-            row
-        }
-        None => {
-            if latest.deleted_at.is_some() {
-                return Err(ApiError::not_found("secret not found"));
-            }
-
-            latest.clone()
+    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "kv.read",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
         }
     };
 
-    let value = decrypt_secret_row(&state, &row).await?;
+    let result: std::result::Result<Json<SecretReadResponse>, ApiError> = async {
+        let latest = load_latest_secret_row(&state.pool, &mount, &secret_path, &key)
+            .await?
+            .ok_or_else(|| ApiError::not_found("secret not found"))?;
 
-    Ok(Json(SecretReadResponse {
-        mount: row.mount,
-        path: row.path,
-        key: row.secret_key,
-        value,
-        version: row.version,
-        current_version: latest.version,
-        updated_at: row.updated_at,
-    }))
+        let row = match query.version {
+            Some(version) => {
+                if version <= 0 {
+                    return Err(ApiError::bad_request("version must be greater than zero"));
+                }
+
+                let row = load_secret_version_row(&state.pool, &mount, &secret_path, &key, version)
+                    .await?
+                    .ok_or_else(|| ApiError::not_found("secret version not found"))?;
+
+                if row.deleted_at.is_some() {
+                    return Err(ApiError::not_found("secret version is deleted"));
+                }
+
+                row
+            }
+            None => {
+                if latest.deleted_at.is_some() {
+                    return Err(ApiError::not_found("secret not found"));
+                }
+
+                latest.clone()
+            }
+        };
+
+        let value = decrypt_secret_row(&state, &row).await?;
+
+        Ok(Json(SecretReadResponse {
+            mount: row.mount,
+            path: row.path,
+            key: row.secret_key,
+            value,
+            version: row.version,
+            current_version: latest.version,
+            updated_at: row.updated_at,
+        }))
+    }
+    .await;
+
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.read",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                true,
+                StatusCode::OK,
+                None,
+                serde_json::json!({ "version": response.0.version }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.read",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn read_secret_metadata(
@@ -704,54 +1029,115 @@ async fn write_secret(
     State(state): State<AppState>,
     Json(payload): Json<SecretWriteRequest>,
 ) -> std::result::Result<Json<SecretWriteResponse>, ApiError> {
+    let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    authorize_path(&headers, &state, &mount, &secret_path).await?;
+    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "kv.write",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
 
-    let encrypted = state
-        .cipher
-        .encrypt(&payload.value)
-        .await
-        .map_err(|err| ApiError::internal(format!("encrypt failed: {err}")))?;
+    let result: std::result::Result<Json<SecretWriteResponse>, ApiError> = async {
+        let encrypted = state
+            .cipher
+            .encrypt(&payload.value)
+            .await
+            .map_err(|err| ApiError::internal(format!("encrypt failed: {err}")))?;
 
-    let mut tx = state.pool.begin().await?;
-    // Serialize version allocation per logical secret to avoid duplicate version races.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || '|' || $2 || '|' || $3))")
+        let mut tx = state.pool.begin().await?;
+        // Serialize version allocation per logical secret to avoid duplicate version races.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || '|' || $2 || '|' || $3))")
+            .bind(&mount)
+            .bind(&secret_path)
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
+
+        let row = sqlx::query_as::<_, SecretRow>(
+            r#"
+            INSERT INTO secrets (mount, path, secret_key, encrypted_value, cipher_algorithm, version)
+            SELECT
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                COALESCE(MAX(version), 0) + 1
+            FROM secrets
+            WHERE mount = $1 AND path = $2 AND secret_key = $3
+            RETURNING id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+            "#,
+        )
         .bind(&mount)
         .bind(&secret_path)
         .bind(&key)
-        .execute(&mut *tx)
+        .bind(&encrypted.payload)
+        .bind(&encrypted.algorithm)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
 
-    let row = sqlx::query_as::<_, SecretRow>(
-        r#"
-        INSERT INTO secrets (mount, path, secret_key, encrypted_value, cipher_algorithm, version)
-        SELECT
-            $1,
-            $2,
-            $3,
-            $4,
-            $5,
-            COALESCE(MAX(version), 0) + 1
-        FROM secrets
-        WHERE mount = $1 AND path = $2 AND secret_key = $3
-        RETURNING id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
-        "#,
-    )
-    .bind(&mount)
-    .bind(&secret_path)
-    .bind(&key)
-    .bind(&encrypted.payload)
-    .bind(&encrypted.algorithm)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
+        Ok(Json(SecretWriteResponse {
+            mount: row.mount,
+            path: row.path,
+            key: row.secret_key,
+            version: row.version,
+        }))
+    }
+    .await;
 
-    Ok(Json(SecretWriteResponse {
-        mount: row.mount,
-        path: row.path,
-        key: row.secret_key,
-        version: row.version,
-    }))
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.write",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                true,
+                StatusCode::OK,
+                None,
+                serde_json::json!({ "version": response.0.version }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.write",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn delete_secret(
@@ -759,35 +1145,96 @@ async fn delete_secret(
     Path((mount, path)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> std::result::Result<StatusCode, ApiError> {
+    let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    authorize_path(&headers, &state, &mount, &secret_path).await?;
+    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "kv.delete",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
 
-    let result = sqlx::query(
-        r#"
-        WITH latest AS (
-            SELECT id
-            FROM secrets
-            WHERE mount = $1 AND path = $2 AND secret_key = $3
-            ORDER BY version DESC
-            LIMIT 1
+    let result: std::result::Result<StatusCode, ApiError> = async {
+        let result = sqlx::query(
+            r#"
+            WITH latest AS (
+                SELECT id
+                FROM secrets
+                WHERE mount = $1 AND path = $2 AND secret_key = $3
+                ORDER BY version DESC
+                LIMIT 1
+            )
+            UPDATE secrets
+            SET deleted_at = NOW(), updated_at = NOW()
+            WHERE id IN (SELECT id FROM latest)
+              AND deleted_at IS NULL
+            "#,
         )
-        UPDATE secrets
-        SET deleted_at = NOW(), updated_at = NOW()
-        WHERE id IN (SELECT id FROM latest)
-          AND deleted_at IS NULL
-        "#,
-    )
-    .bind(&mount)
-    .bind(&secret_path)
-    .bind(&key)
-    .execute(&state.pool)
-    .await?;
+        .bind(&mount)
+        .bind(&secret_path)
+        .bind(&key)
+        .execute(&state.pool)
+        .await?;
 
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("secret not found"));
+        if result.rows_affected() == 0 {
+            return Err(ApiError::not_found("secret not found"));
+        }
+
+        Ok(StatusCode::NO_CONTENT)
     }
+    .await;
 
-    Ok(StatusCode::NO_CONTENT)
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.delete",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                true,
+                StatusCode::NO_CONTENT,
+                None,
+                serde_json::json!({}),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.delete",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn undelete_secret(
@@ -796,31 +1243,91 @@ async fn undelete_secret(
     State(state): State<AppState>,
     Json(payload): Json<SecretVersionActionRequest>,
 ) -> std::result::Result<StatusCode, ApiError> {
+    let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    authorize_path(&headers, &state, &mount, &secret_path).await?;
+    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "kv.undelete",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
     let versions = normalize_requested_versions(payload.versions)?;
+    let result: std::result::Result<StatusCode, ApiError> = async {
+        ensure_secret_versions_exist(&state.pool, &mount, &secret_path, &key, &versions).await?;
 
-    ensure_secret_versions_exist(&state.pool, &mount, &secret_path, &key, &versions).await?;
+        sqlx::query(
+            r#"
+            UPDATE secrets
+            SET deleted_at = NULL, updated_at = NOW()
+            WHERE mount = $1
+              AND path = $2
+              AND secret_key = $3
+              AND version = ANY($4)
+              AND deleted_at IS NOT NULL
+            "#,
+        )
+        .bind(&mount)
+        .bind(&secret_path)
+        .bind(&key)
+        .bind(&versions)
+        .execute(&state.pool)
+        .await?;
 
-    sqlx::query(
-        r#"
-        UPDATE secrets
-        SET deleted_at = NULL, updated_at = NOW()
-        WHERE mount = $1
-          AND path = $2
-          AND secret_key = $3
-          AND version = ANY($4)
-          AND deleted_at IS NOT NULL
-        "#,
-    )
-    .bind(&mount)
-    .bind(&secret_path)
-    .bind(&key)
-    .bind(&versions)
-    .execute(&state.pool)
-    .await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+    .await;
 
-    Ok(StatusCode::NO_CONTENT)
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.undelete",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                true,
+                StatusCode::NO_CONTENT,
+                None,
+                serde_json::json!({ "versions": versions }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.undelete",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({ "versions": versions }),
+            )
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn destroy_secret(
@@ -829,29 +1336,90 @@ async fn destroy_secret(
     State(state): State<AppState>,
     Json(payload): Json<SecretVersionActionRequest>,
 ) -> std::result::Result<StatusCode, ApiError> {
+    let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    authorize_path(&headers, &state, &mount, &secret_path).await?;
+    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "kv.destroy",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
     let versions = normalize_requested_versions(payload.versions)?;
 
-    ensure_secret_versions_exist(&state.pool, &mount, &secret_path, &key, &versions).await?;
+    let result: std::result::Result<StatusCode, ApiError> = async {
+        ensure_secret_versions_exist(&state.pool, &mount, &secret_path, &key, &versions).await?;
 
-    sqlx::query(
-        r#"
-        DELETE FROM secrets
-        WHERE mount = $1
-          AND path = $2
-          AND secret_key = $3
-          AND version = ANY($4)
-        "#,
-    )
-    .bind(&mount)
-    .bind(&secret_path)
-    .bind(&key)
-    .bind(&versions)
-    .execute(&state.pool)
-    .await?;
+        sqlx::query(
+            r#"
+            DELETE FROM secrets
+            WHERE mount = $1
+              AND path = $2
+              AND secret_key = $3
+              AND version = ANY($4)
+            "#,
+        )
+        .bind(&mount)
+        .bind(&secret_path)
+        .bind(&key)
+        .bind(&versions)
+        .execute(&state.pool)
+        .await?;
 
-    Ok(StatusCode::NO_CONTENT)
+        Ok(StatusCode::NO_CONTENT)
+    }
+    .await;
+
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.destroy",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                true,
+                StatusCode::NO_CONTENT,
+                None,
+                serde_json::json!({ "versions": versions }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "kv.destroy",
+                Some(&mount),
+                Some(&secret_path),
+                Some(&key),
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({ "versions": versions }),
+            )
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 async fn delete_token(
@@ -859,28 +1427,90 @@ async fn delete_token(
     Path(token_id): Path<Uuid>,
     State(state): State<AppState>,
 ) -> std::result::Result<StatusCode, ApiError> {
-    let auth = authorize_admin(&headers, &state).await?;
-    if auth.token_id == token_id {
-        return Err(ApiError::bad_request(
-            "cannot delete the token used for this request",
-        ));
+    let request_id = request_id_from_headers(&headers);
+    let auth = authorize_admin(&headers, &state).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "token.delete",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({ "target_token_id": token_id }),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+
+    let result: std::result::Result<StatusCode, ApiError> = async {
+        if auth.token_id == token_id {
+            return Err(ApiError::bad_request(
+                "cannot delete the token used for this request",
+            ));
+        }
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM service_tokens
+            WHERE id = $1
+            "#,
+        )
+        .bind(token_id)
+        .execute(&state.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(ApiError::not_found("token not found"));
+        }
+
+        Ok(StatusCode::NO_CONTENT)
     }
+    .await;
 
-    let result = sqlx::query(
-        r#"
-        DELETE FROM service_tokens
-        WHERE id = $1
-        "#,
-    )
-    .bind(token_id)
-    .execute(&state.pool)
-    .await?;
-
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("token not found"));
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "token.delete",
+                None,
+                None,
+                None,
+                true,
+                StatusCode::NO_CONTENT,
+                None,
+                serde_json::json!({ "target_token_id": token_id }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "token.delete",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({ "target_token_id": token_id }),
+            )
+            .await?;
+            Err(err)
+        }
     }
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn load_latest_secret_row(
@@ -1221,6 +1851,73 @@ fn new_recovery_key() -> String {
     )
 }
 
+fn request_id_header() -> HeaderName {
+    HeaderName::from_static(REQUEST_ID_HEADER)
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get(request_id_header())
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+async fn write_audit_event(
+    pool: &PgPool,
+    request_id: &str,
+    actor_token_id: Option<Uuid>,
+    action: &str,
+    mount: Option<&str>,
+    path: Option<&str>,
+    secret_key: Option<&str>,
+    success: bool,
+    status: StatusCode,
+    error: Option<&str>,
+    metadata: serde_json::Value,
+) -> std::result::Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO audit_events (
+            request_id,
+            actor_token_id,
+            action,
+            mount,
+            path,
+            secret_key,
+            success,
+            status_code,
+            error,
+            metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "#,
+    )
+    .bind(request_id)
+    .bind(actor_token_id)
+    .bind(action)
+    .bind(mount)
+    .bind(path)
+    .bind(secret_key)
+    .bind(success)
+    .bind(i32::from(status.as_u16()))
+    .bind(error)
+    .bind(metadata)
+    .execute(pool)
+    .await?;
+
+    info!(
+        request_id = %request_id,
+        action = %action,
+        success,
+        status = status.as_u16(),
+        "audit event recorded"
+    );
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -1297,10 +1994,11 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::{
         AppState, ListQuery, ReadQuery, SecretVersionActionRequest, SecretWriteRequest,
-        authorize_path, delete_secret, destroy_secret, hash_token, init_system, list_secrets,
-        normalize_path_prefix, normalize_requested_versions, read_secret, read_secret_metadata,
-        read_system_init_status, recover_root, revoke_root, rotate_root, split_secret_path,
-        undelete_secret, validate_token, write_secret,
+        authorize_path, create_token, delete_secret, delete_token, destroy_secret, hash_token,
+        init_system, list_secrets, list_tokens, normalize_path_prefix,
+        normalize_requested_versions, read_secret, read_secret_metadata, read_system_init_status,
+        recover_root, revoke_root, rotate_root, split_secret_path, undelete_secret, validate_token,
+        write_secret,
     };
     use axum::{
         Json,
@@ -1308,10 +2006,21 @@ mod tests {
         http::{HeaderMap, HeaderValue, StatusCode, header},
     };
     use secret_engine_core::crypto::AesGcmCipher;
-    use secret_engine_core::model::SystemRootRecoverRequest;
+    use secret_engine_core::model::{SystemRootRecoverRequest, TokenCreateRequest, TokenScope};
     use sqlx::PgPool;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    #[derive(Debug, Clone, sqlx::FromRow)]
+    struct AuditEventRow {
+        action: String,
+        request_id: String,
+        mount: Option<String>,
+        path: Option<String>,
+        secret_key: Option<String>,
+        success: bool,
+        status_code: i32,
+    }
 
     #[test]
     fn split_secret_path_supports_nested_paths() {
@@ -1632,6 +2341,128 @@ mod tests {
         assert_eq!(recovered_valid, StatusCode::NO_CONTENT);
     }
 
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn audit_records_kv_reads_and_mutations(pool: PgPool) {
+        let state = test_state(pool.clone());
+        let headers = with_request_id(admin_headers(&pool).await, "req-kv-audit");
+        let mount = "kv".to_string();
+        let secret = "apps/demo/password".to_string();
+
+        let _ = write_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            State(state.clone()),
+            Json(SecretWriteRequest {
+                value: "value-v1".to_string(),
+            }),
+        )
+        .await
+        .expect("write");
+
+        let _ = read_secret(
+            headers.clone(),
+            Path((mount.clone(), secret.clone())),
+            Query(ReadQuery { version: None }),
+            State(state.clone()),
+        )
+        .await
+        .expect("read");
+
+        delete_secret(
+            headers,
+            Path((mount.clone(), secret.clone())),
+            State(state.clone()),
+        )
+        .await
+        .expect("delete");
+
+        let rows = load_audit_events(&pool, "req-kv-audit").await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].action, "kv.write");
+        assert_eq!(rows[1].action, "kv.read");
+        assert_eq!(rows[2].action, "kv.delete");
+        assert!(rows.iter().all(|row| row.success));
+        assert!(rows.iter().all(|row| row.request_id == "req-kv-audit"));
+        assert!(rows.iter().all(|row| row.mount.as_deref() == Some("kv")));
+        assert!(
+            rows.iter()
+                .all(|row| row.path.as_deref() == Some("apps/demo"))
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.secret_key.as_deref() == Some("password"))
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn audit_records_auth_and_token_management(pool: PgPool) {
+        let state = test_state(pool.clone());
+        let init = init_system(State(state.clone())).await.expect("init");
+
+        let validate_headers =
+            with_request_id(bearer_headers(&init.0.root_token), "req-auth-validate");
+        validate_token(validate_headers, State(state.clone()))
+            .await
+            .expect("validate");
+
+        let list_headers = with_request_id(bearer_headers(&init.0.root_token), "req-token-list");
+        let _ = list_tokens(list_headers, State(state.clone()))
+            .await
+            .expect("list tokens");
+
+        let create_headers =
+            with_request_id(bearer_headers(&init.0.root_token), "req-token-create");
+        let created = create_token(
+            create_headers,
+            State(state.clone()),
+            Json(TokenCreateRequest {
+                label: "worker".to_string(),
+                admin: false,
+                expires_at: None,
+                scopes: vec![TokenScope {
+                    mount: "kv".to_string(),
+                    path_prefix: "apps".to_string(),
+                }],
+            }),
+        )
+        .await
+        .expect("create token");
+
+        let delete_headers =
+            with_request_id(bearer_headers(&init.0.root_token), "req-token-delete");
+        delete_token(
+            delete_headers,
+            Path(created.0.metadata.id),
+            State(state.clone()),
+        )
+        .await
+        .expect("delete token");
+
+        let validate_rows = load_audit_events(&pool, "req-auth-validate").await;
+        assert_eq!(validate_rows.len(), 1);
+        assert_eq!(validate_rows[0].action, "auth.validate");
+        assert!(validate_rows[0].success);
+        assert_eq!(
+            validate_rows[0].status_code,
+            i32::from(StatusCode::NO_CONTENT.as_u16())
+        );
+
+        let list_rows = load_audit_events(&pool, "req-token-list").await;
+        assert_eq!(list_rows.len(), 1);
+        assert_eq!(list_rows[0].action, "token.list");
+        assert!(list_rows[0].success);
+
+        let create_rows = load_audit_events(&pool, "req-token-create").await;
+        assert_eq!(create_rows.len(), 1);
+        assert_eq!(create_rows[0].action, "token.create");
+        assert!(create_rows[0].success);
+
+        let delete_rows = load_audit_events(&pool, "req-token-delete").await;
+        assert_eq!(delete_rows.len(), 1);
+        assert_eq!(delete_rows[0].action, "token.delete");
+        assert!(delete_rows[0].success);
+    }
+
     fn test_state(pool: PgPool) -> AppState {
         AppState {
             pool,
@@ -1677,5 +2508,26 @@ mod tests {
         let value = HeaderValue::from_str(&format!("Bearer {token}")).expect("header");
         headers.insert(header::AUTHORIZATION, value);
         headers
+    }
+
+    fn with_request_id(mut headers: HeaderMap, request_id: &str) -> HeaderMap {
+        let value = HeaderValue::from_str(request_id).expect("request-id");
+        headers.insert("x-request-id", value);
+        headers
+    }
+
+    async fn load_audit_events(pool: &PgPool, request_id: &str) -> Vec<AuditEventRow> {
+        sqlx::query_as::<_, AuditEventRow>(
+            r#"
+            SELECT action, request_id, mount, path, secret_key, success, status_code
+            FROM audit_events
+            WHERE request_id = $1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(request_id)
+        .fetch_all(pool)
+        .await
+        .expect("load audit rows")
     }
 }
