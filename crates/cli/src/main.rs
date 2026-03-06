@@ -4,6 +4,7 @@ use reqwest::{Client, Method, StatusCode};
 use secret_engine_core::model::{
     SecretListResponse, SecretMetadataResponse, SecretReadResponse, SecretVersionActionRequest,
     SecretWriteRequest, SecretWriteResponse, SystemInitResponse, SystemInitStatusResponse,
+    SystemRootRecoverRequest, SystemRootRecoverResponse, SystemRootRotateResponse,
 };
 use url::Url;
 
@@ -44,6 +45,23 @@ enum Commands {
 enum SysCommand {
     Init,
     Status,
+    Root {
+        #[command(subcommand)]
+        command: SysRootCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SysRootCommand {
+    Rotate,
+    Revoke,
+    Recover(SysRecoverArgs),
+}
+
+#[derive(Debug, Args)]
+struct SysRecoverArgs {
+    #[arg(long)]
+    recovery_key: String,
 }
 
 #[derive(Debug, Args)]
@@ -117,6 +135,11 @@ async fn main() -> Result<()> {
         Commands::Sys { command } => match command {
             SysCommand::Init => api.sys_init().await?,
             SysCommand::Status => api.sys_status().await?,
+            SysCommand::Root { command } => match command {
+                SysRootCommand::Rotate => api.sys_root_rotate().await?,
+                SysRootCommand::Revoke => api.sys_root_revoke().await?,
+                SysRootCommand::Recover(args) => api.sys_root_recover(args).await?,
+            },
         },
         Commands::Kv { command } => match command {
             KvCommand::Put(args) => api.kv_put(args).await?,
@@ -165,6 +188,7 @@ impl Api {
 
         println!("system initialized at {}", response.initialized_at);
         println!("root token: {}", response.root_token);
+        println!("recovery key: {}", response.recovery_key);
         println!("export SECRET_ENGINE_TOKEN={}", response.root_token);
         Ok(())
     }
@@ -181,6 +205,48 @@ impl Api {
         } else {
             println!("initialized=false");
         }
+        Ok(())
+    }
+
+    async fn sys_root_rotate(&self) -> Result<()> {
+        let response: SystemRootRotateResponse = self
+            .send::<()>(Method::POST, "/api/v1/sys/root/rotate", None)
+            .await?
+            .json()
+            .await?;
+
+        println!("root rotated at {}", response.rotated_at);
+        println!("new root token: {}", response.root_token);
+        println!("new recovery key: {}", response.recovery_key);
+        println!("export SECRET_ENGINE_TOKEN={}", response.root_token);
+        Ok(())
+    }
+
+    async fn sys_root_revoke(&self) -> Result<()> {
+        let response = self
+            .send::<()>(Method::POST, "/api/v1/sys/root/revoke", None)
+            .await?;
+        if response.status() != StatusCode::NO_CONTENT {
+            bail!("root revoke failed: {}", response.status());
+        }
+        println!("root token revoked");
+        Ok(())
+    }
+
+    async fn sys_root_recover(&self, args: SysRecoverArgs) -> Result<()> {
+        let payload = SystemRootRecoverRequest {
+            recovery_key: args.recovery_key,
+        };
+        let response: SystemRootRecoverResponse = self
+            .send(Method::POST, "/api/v1/sys/root/recover", Some(&payload))
+            .await?
+            .json()
+            .await?;
+
+        println!("root recovered at {}", response.recovered_at);
+        println!("new root token: {}", response.root_token);
+        println!("new recovery key: {}", response.recovery_key);
+        println!("export SECRET_ENGINE_TOKEN={}", response.root_token);
         Ok(())
     }
 
