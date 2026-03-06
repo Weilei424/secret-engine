@@ -39,7 +39,6 @@ Important server settings:
 - `SECRET_ENGINE__PORT`
 - `SECRET_ENGINE__DATABASE_URL`
 - `SECRET_ENGINE__ALLOWED_ORIGINS`
-- `SECRET_ENGINE__ADMIN_TOKEN`
 - `SECRET_ENGINE__MASTER_KEY`
 
 Important frontend setting:
@@ -76,7 +75,6 @@ If PostgreSQL is already available:
 ```bash
 export SECRET_ENGINE__DATABASE_URL=postgres://secret:secret@127.0.0.1:5432/secret_engine
 export SECRET_ENGINE__ALLOWED_ORIGINS='["http://localhost:3000","http://127.0.0.1:3000"]'
-export SECRET_ENGINE__ADMIN_TOKEN=dev-root-token
 export SECRET_ENGINE__MASTER_KEY=dev-master-key-change-me
 
 cargo run -p secret-engine-server
@@ -86,9 +84,12 @@ cargo run -p secret-engine-server
 
 ```bash
 export SECRET_ENGINE_ADDR=http://127.0.0.1:8080
-export SECRET_ENGINE_TOKEN=dev-root-token
+
+cargo run -p secret-engine-cli -- sys init
+export SECRET_ENGINE_TOKEN=REPLACE_WITH_ROOT_TOKEN
 
 cargo run -p secret-engine-cli -- status
+cargo run -p secret-engine-cli -- sys status
 cargo run -p secret-engine-cli -- kv put apps/demo/password super-secret
 cargo run -p secret-engine-cli -- kv get apps/demo/password
 cargo run -p secret-engine-cli -- kv list --prefix apps/

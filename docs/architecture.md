@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`secret-engine` is a Rust-based secret management system modeled after the basic shape of HashiCorp Vault. The current implementation is an MVP focused on a single KV secret engine, a single bootstrap token, PostgreSQL-backed persistence, and local/container deployment.
+`secret-engine` is a Rust-based secret management system modeled after the basic shape of HashiCorp Vault. The current implementation is an MVP focused on a single KV secret engine, explicit one-time initialization with a root token, PostgreSQL-backed persistence, and local/container deployment.
 
 The design goal is to keep the initial system simple while leaving room for stronger authentication, policy controls, encryption changes, and Kubernetes hardening.
 
@@ -43,7 +43,7 @@ The design goal is to keep the initial system simple while leaving room for stro
 ### Write secret
 
 1. A client sends `POST /api/v1/kv/<mount>/<path>/<key>` with a bearer token and plaintext secret value.
-2. The server validates the bearer token against the configured bootstrap token.
+2. The server validates the bearer token against stored service tokens (after initialization).
 3. The server encrypts the plaintext using the configured cipher implementation.
 4. The server stores the encrypted payload, algorithm identifier, and version metadata in PostgreSQL.
 5. The server returns mount/path/key/version metadata.
@@ -147,11 +147,11 @@ The upgrade path is preserved by the `SecretCipher` trait in `crates/core`, whic
 
 ### Current
 
-- Single bootstrap admin token from environment.
+- Explicit init flow that mints a root token once.
 - No user identities.
 - No policy enforcement.
 - No audit trail.
-- No token issuance or expiry.
+- Service token issuance is available, with optional expiry.
 
 ### Intended future direction
 
@@ -196,8 +196,8 @@ Production hardening will require:
 
 ## Immediate architectural priorities
 
-1. Add integration tests against PostgreSQL for the current KV flow.
-2. Replace the fixed bootstrap token model with an explicit initialization flow.
-3. Introduce token records and path-based policies.
-4. Add secret version history.
+1. Expand integration tests against PostgreSQL for current KV/auth flows.
+2. Add audit logging and request correlation.
+3. Harden policy expressiveness beyond path-prefix checks.
+4. Add key-rotation lifecycle support.
 5. Harden deployment manifests for realistic Kubernetes usage.
