@@ -14,8 +14,9 @@ use secret_engine_core::{
     model::{
         SecretListResponse, SecretMetadata, SecretMetadataResponse, SecretReadResponse,
         SecretVersionActionRequest, SecretVersionMetadata, SecretWriteRequest, SecretWriteResponse,
-        SystemInitResponse, SystemInitStatusResponse, TokenCreateRequest, TokenCreateResponse,
-        TokenListResponse, TokenMetadata, TokenScope,
+        SystemInitResponse, SystemInitStatusResponse, SystemRootRecoverRequest,
+        SystemRootRecoverResponse, SystemRootRotateResponse, TokenCreateRequest,
+        TokenCreateResponse, TokenListResponse, TokenMetadata, TokenScope,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -106,6 +107,12 @@ struct TokenPolicyRow {
     path_prefix: String,
 }
 
+#[derive(Debug, Clone, FromRow)]
+struct SystemStateRow {
+    initialized_at: Option<chrono::DateTime<chrono::Utc>>,
+    recovery_key_hash: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct AuthContext {
     token_id: Uuid,
@@ -163,6 +170,12 @@ async fn main() -> AnyResult<()> {
         .route(
             "/api/v1/sys/init",
             get(read_system_init_status).post(init_system),
+        )
+        .route("/api/v1/sys/root/rotate", axum::routing::post(rotate_root))
+        .route("/api/v1/sys/root/revoke", axum::routing::post(revoke_root))
+        .route(
+            "/api/v1/sys/root/recover",
+            axum::routing::post(recover_root),
         )
         .route("/api/v1/auth/validate", get(validate_token))
         .route("/api/v1/tokens", get(list_tokens).post(create_token))
@@ -260,8 +273,10 @@ async fn init_system(
         return Err(ApiError::conflict("system is already initialized"));
     }
 
-    let root_token = format!("se_root_{}", Uuid::new_v4().simple());
+    let root_token = new_root_token();
+    let recovery_key = new_recovery_key();
     let root_token_hash = hash_token(&root_token);
+    let recovery_key_hash = hash_token(&recovery_key);
     let root_token_id = Uuid::new_v4();
 
     sqlx::query(
@@ -278,11 +293,12 @@ async fn init_system(
     let initialized_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
         r#"
         UPDATE system_state
-        SET initialized_at = NOW(), updated_at = NOW()
+        SET initialized_at = NOW(), recovery_key_hash = $1, updated_at = NOW()
         WHERE id = 1
         RETURNING initialized_at
         "#,
     )
+    .bind(recovery_key_hash)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -290,7 +306,154 @@ async fn init_system(
 
     Ok(Json(SystemInitResponse {
         root_token,
+        recovery_key,
         initialized_at,
+    }))
+}
+
+async fn rotate_root(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<SystemRootRotateResponse>, ApiError> {
+    authorize_root(&headers, &state).await?;
+    let mut tx = state.pool.begin().await?;
+
+    let root_token = new_root_token();
+    let recovery_key = new_recovery_key();
+    let root_token_hash = hash_token(&root_token);
+    let recovery_key_hash = hash_token(&recovery_key);
+
+    let rotated_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+        r#"
+        UPDATE service_tokens
+        SET token_hash = $1, is_admin = TRUE, expires_at = NULL, updated_at = NOW()
+        WHERE bootstrap_slot = 1
+        RETURNING updated_at
+        "#,
+    )
+    .bind(root_token_hash)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::not_found("root token not found"))?;
+
+    sqlx::query(
+        r#"
+        UPDATE system_state
+        SET recovery_key_hash = $1, updated_at = NOW()
+        WHERE id = 1
+        "#,
+    )
+    .bind(recovery_key_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Json(SystemRootRotateResponse {
+        root_token,
+        recovery_key,
+        rotated_at,
+    }))
+}
+
+async fn revoke_root(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> std::result::Result<StatusCode, ApiError> {
+    authorize_root(&headers, &state).await?;
+
+    let result = sqlx::query(
+        r#"
+        DELETE FROM service_tokens
+        WHERE bootstrap_slot = 1
+        "#,
+    )
+    .execute(&state.pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("root token not found"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn recover_root(
+    State(state): State<AppState>,
+    Json(payload): Json<SystemRootRecoverRequest>,
+) -> std::result::Result<Json<SystemRootRecoverResponse>, ApiError> {
+    if payload.recovery_key.trim().is_empty() {
+        return Err(ApiError::bad_request("recovery key cannot be empty"));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let system_row = sqlx::query_as::<_, SystemStateRow>(
+        r#"
+        SELECT initialized_at, recovery_key_hash
+        FROM system_state
+        WHERE id = 1
+        FOR UPDATE
+        "#,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::service_unavailable("system state row is missing"))?;
+
+    if system_row.initialized_at.is_none() {
+        return Err(ApiError::service_unavailable(
+            "server is not initialized; call POST /api/v1/sys/init",
+        ));
+    }
+
+    let recovery_hash = system_row
+        .recovery_key_hash
+        .ok_or_else(|| ApiError::conflict("recovery key is not configured; rotate root first"))?;
+
+    if recovery_hash != hash_token(payload.recovery_key.trim()) {
+        return Err(ApiError::unauthorized("recovery key rejected"));
+    }
+
+    let root_token = new_root_token();
+    let new_recovery_key = new_recovery_key();
+    let root_token_hash = hash_token(&root_token);
+    let new_recovery_key_hash = hash_token(&new_recovery_key);
+    let root_id = Uuid::new_v4();
+
+    let recovered_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+        r#"
+        INSERT INTO service_tokens (id, label, token_hash, is_admin, bootstrap_slot)
+        VALUES ($1, 'root', $2, TRUE, 1)
+        ON CONFLICT (bootstrap_slot)
+        DO UPDATE SET
+            token_hash = EXCLUDED.token_hash,
+            is_admin = TRUE,
+            expires_at = NULL,
+            updated_at = NOW()
+        RETURNING updated_at
+        "#,
+    )
+    .bind(root_id)
+    .bind(root_token_hash)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE system_state
+        SET recovery_key_hash = $1, updated_at = NOW()
+        WHERE id = 1
+        "#,
+    )
+    .bind(new_recovery_key_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Json(SystemRootRecoverResponse {
+        root_token,
+        recovery_key: new_recovery_key,
+        recovered_at,
     }))
 }
 
@@ -886,6 +1049,19 @@ async fn is_initialized(pool: &PgPool) -> std::result::Result<bool, ApiError> {
     Ok(load_initialized_at(pool).await?.is_some())
 }
 
+async fn load_root_token_id(pool: &PgPool) -> std::result::Result<Option<Uuid>, ApiError> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id
+        FROM service_tokens
+        WHERE bootstrap_slot = 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::from)
+}
+
 async fn authorize_admin(
     headers: &HeaderMap,
     state: &AppState,
@@ -894,6 +1070,22 @@ async fn authorize_admin(
     if !auth.is_admin {
         return Err(ApiError::forbidden("admin token required"));
     }
+    Ok(auth)
+}
+
+async fn authorize_root(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> std::result::Result<AuthContext, ApiError> {
+    let auth = authenticate(headers, state).await?;
+    let root_id = load_root_token_id(&state.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("root token not found"))?;
+
+    if auth.token_id != root_id {
+        return Err(ApiError::forbidden("root token required"));
+    }
+
     Ok(auth)
 }
 
@@ -1017,6 +1209,18 @@ fn hash_token(token: &str) -> String {
     format!("{digest:x}")
 }
 
+fn new_root_token() -> String {
+    format!("se_root_{}", Uuid::new_v4().simple())
+}
+
+fn new_recovery_key() -> String {
+    format!(
+        "se_recovery_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -1095,7 +1299,8 @@ mod tests {
         AppState, ListQuery, ReadQuery, SecretVersionActionRequest, SecretWriteRequest,
         authorize_path, delete_secret, destroy_secret, hash_token, init_system, list_secrets,
         normalize_path_prefix, normalize_requested_versions, read_secret, read_secret_metadata,
-        read_system_init_status, split_secret_path, undelete_secret, validate_token, write_secret,
+        read_system_init_status, recover_root, revoke_root, rotate_root, split_secret_path,
+        undelete_secret, validate_token, write_secret,
     };
     use axum::{
         Json,
@@ -1103,6 +1308,7 @@ mod tests {
         http::{HeaderMap, HeaderValue, StatusCode, header},
     };
     use secret_engine_core::crypto::AesGcmCipher;
+    use secret_engine_core::model::SystemRootRecoverRequest;
     use sqlx::PgPool;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -1361,6 +1567,7 @@ mod tests {
 
         let init_response = init_system(State(state.clone())).await.expect("initialize");
         assert!(init_response.0.root_token.starts_with("se_root_"));
+        assert!(init_response.0.recovery_key.starts_with("se_recovery_"));
 
         let second_init = init_system(State(state.clone()))
             .await
@@ -1377,6 +1584,52 @@ mod tests {
             .await
             .expect("root token should validate");
         assert_eq!(valid, StatusCode::NO_CONTENT);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn root_rotate_recover_revoke_lifecycle(pool: PgPool) {
+        let state = test_state(pool.clone());
+        let init_response = init_system(State(state.clone())).await.expect("initialize");
+
+        let root_headers = bearer_headers(&init_response.0.root_token);
+        let rotated = rotate_root(root_headers.clone(), State(state.clone()))
+            .await
+            .expect("rotate root");
+        assert!(rotated.0.root_token.starts_with("se_root_"));
+        assert!(rotated.0.recovery_key.starts_with("se_recovery_"));
+
+        let old_root_validate = validate_token(root_headers, State(state.clone()))
+            .await
+            .expect_err("old root token should fail");
+        assert_eq!(old_root_validate.status, StatusCode::UNAUTHORIZED);
+
+        let rotated_headers = bearer_headers(&rotated.0.root_token);
+        let valid_rotated = validate_token(rotated_headers.clone(), State(state.clone()))
+            .await
+            .expect("rotated root should validate");
+        assert_eq!(valid_rotated, StatusCode::NO_CONTENT);
+
+        revoke_root(rotated_headers.clone(), State(state.clone()))
+            .await
+            .expect("revoke root");
+        let revoked_validate = validate_token(rotated_headers, State(state.clone()))
+            .await
+            .expect_err("revoked root should fail");
+        assert_eq!(revoked_validate.status, StatusCode::UNAUTHORIZED);
+
+        let recovered = recover_root(
+            State(state.clone()),
+            Json(SystemRootRecoverRequest {
+                recovery_key: rotated.0.recovery_key,
+            }),
+        )
+        .await
+        .expect("recover root");
+        let recovered_headers = bearer_headers(&recovered.0.root_token);
+        let recovered_valid = validate_token(recovered_headers, State(state))
+            .await
+            .expect("recovered root should validate");
+        assert_eq!(recovered_valid, StatusCode::NO_CONTENT);
     }
 
     fn test_state(pool: PgPool) -> AppState {
