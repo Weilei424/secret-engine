@@ -14,7 +14,8 @@ use secret_engine_core::{
     model::{
         SecretListResponse, SecretMetadata, SecretMetadataResponse, SecretReadResponse,
         SecretVersionActionRequest, SecretVersionMetadata, SecretWriteRequest, SecretWriteResponse,
-        TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata, TokenScope,
+        SystemInitResponse, SystemInitStatusResponse, TokenCreateRequest, TokenCreateResponse,
+        TokenListResponse, TokenMetadata, TokenScope,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,6 @@ struct Settings {
     port: u16,
     database_url: String,
     allowed_origins: Vec<String>,
-    admin_token: String,
     master_key: String,
 }
 
@@ -149,10 +149,6 @@ async fn main() -> AnyResult<()> {
         .await
         .context("failed to run migrations")?;
 
-    ensure_bootstrap_token(&pool, &settings.admin_token)
-        .await
-        .context("failed to seed bootstrap token")?;
-
     let state = AppState {
         pool,
         cipher: Arc::new(
@@ -164,6 +160,10 @@ async fn main() -> AnyResult<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route(
+            "/api/v1/sys/init",
+            get(read_system_init_status).post(init_system),
+        )
         .route("/api/v1/auth/validate", get(validate_token))
         .route("/api/v1/tokens", get(list_tokens).post(create_token))
         .route(
@@ -227,6 +227,71 @@ async fn validate_token(
 ) -> std::result::Result<StatusCode, ApiError> {
     authenticate(&headers, &state).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn read_system_init_status(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<SystemInitStatusResponse>, ApiError> {
+    let initialized_at = load_initialized_at(&state.pool).await?;
+    Ok(Json(SystemInitStatusResponse {
+        initialized: initialized_at.is_some(),
+        initialized_at,
+    }))
+}
+
+async fn init_system(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<SystemInitResponse>, ApiError> {
+    let mut tx = state.pool.begin().await?;
+
+    let already_initialized = sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+        r#"
+        SELECT initialized_at
+        FROM system_state
+        WHERE id = 1
+        FOR UPDATE
+        "#,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+
+    if already_initialized.is_some() {
+        return Err(ApiError::conflict("system is already initialized"));
+    }
+
+    let root_token = format!("se_root_{}", Uuid::new_v4().simple());
+    let root_token_hash = hash_token(&root_token);
+    let root_token_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO service_tokens (id, label, token_hash, is_admin, bootstrap_slot)
+        VALUES ($1, 'root', $2, TRUE, 1)
+        "#,
+    )
+    .bind(root_token_id)
+    .bind(root_token_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    let initialized_at = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+        r#"
+        UPDATE system_state
+        SET initialized_at = NOW(), updated_at = NOW()
+        WHERE id = 1
+        RETURNING initialized_at
+        "#,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Json(SystemInitResponse {
+        root_token,
+        initialized_at,
+    }))
 }
 
 async fn list_tokens(
@@ -655,26 +720,6 @@ async fn delete_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn ensure_bootstrap_token(pool: &PgPool, token: &str) -> AnyResult<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO service_tokens (label, token_hash, is_admin, bootstrap_slot)
-        VALUES ('bootstrap-admin', $1, TRUE, 1)
-        ON CONFLICT (bootstrap_slot)
-        DO UPDATE SET
-            token_hash = EXCLUDED.token_hash,
-            is_admin = TRUE,
-            expires_at = NULL,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(hash_token(token.trim()))
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 async fn load_latest_secret_row(
     pool: &PgPool,
     mount: &str,
@@ -821,6 +866,26 @@ async fn load_token_metadata(
     })
 }
 
+async fn load_initialized_at(
+    pool: &PgPool,
+) -> std::result::Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
+    sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+        r#"
+        SELECT initialized_at
+        FROM system_state
+        WHERE id = 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.flatten())
+    .map_err(ApiError::from)
+}
+
+async fn is_initialized(pool: &PgPool) -> std::result::Result<bool, ApiError> {
+    Ok(load_initialized_at(pool).await?.is_some())
+}
+
 async fn authorize_admin(
     headers: &HeaderMap,
     state: &AppState,
@@ -875,6 +940,12 @@ async fn authenticate(
     headers: &HeaderMap,
     state: &AppState,
 ) -> std::result::Result<AuthContext, ApiError> {
+    if !is_initialized(&state.pool).await? {
+        return Err(ApiError::service_unavailable(
+            "server is not initialized; call POST /api/v1/sys/init",
+        ));
+    }
+
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -981,6 +1052,20 @@ impl ApiError {
         }
     }
 
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
+    fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1008,9 +1093,9 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::{
         AppState, ListQuery, ReadQuery, SecretVersionActionRequest, SecretWriteRequest,
-        authorize_path, delete_secret, destroy_secret, hash_token, list_secrets,
+        authorize_path, delete_secret, destroy_secret, hash_token, init_system, list_secrets,
         normalize_path_prefix, normalize_requested_versions, read_secret, read_secret_metadata,
-        split_secret_path, undelete_secret, write_secret,
+        read_system_init_status, split_secret_path, undelete_secret, validate_token, write_secret,
     };
     use axum::{
         Json,
@@ -1217,6 +1302,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn authorize_path_enforces_token_scope(pool: PgPool) {
         let state = test_state(pool.clone());
+        mark_initialized(&pool).await;
 
         let token_id = Uuid::new_v4();
         sqlx::query(
@@ -1254,6 +1340,45 @@ mod tests {
         assert_eq!(denied.status, StatusCode::FORBIDDEN);
     }
 
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn init_flow_is_idempotent_and_gates_auth(pool: PgPool) {
+        let state = test_state(pool.clone());
+
+        let status_before = read_system_init_status(State(state.clone()))
+            .await
+            .expect("status before init");
+        assert!(!status_before.0.initialized);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer not-yet-valid"),
+        );
+        let blocked = validate_token(headers, State(state.clone()))
+            .await
+            .expect_err("validate should fail before init");
+        assert_eq!(blocked.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let init_response = init_system(State(state.clone())).await.expect("initialize");
+        assert!(init_response.0.root_token.starts_with("se_root_"));
+
+        let second_init = init_system(State(state.clone()))
+            .await
+            .expect_err("second init should fail");
+        assert_eq!(second_init.status, StatusCode::CONFLICT);
+
+        let status_after = read_system_init_status(State(state.clone()))
+            .await
+            .expect("status after init");
+        assert!(status_after.0.initialized);
+
+        let headers = bearer_headers(&init_response.0.root_token);
+        let valid = validate_token(headers, State(state))
+            .await
+            .expect("root token should validate");
+        assert_eq!(valid, StatusCode::NO_CONTENT);
+    }
+
     fn test_state(pool: PgPool) -> AppState {
         AppState {
             pool,
@@ -1262,6 +1387,8 @@ mod tests {
     }
 
     async fn admin_headers(pool: &PgPool) -> HeaderMap {
+        mark_initialized(pool).await;
+
         sqlx::query(
             r#"
             INSERT INTO service_tokens (id, label, token_hash, is_admin)
@@ -1276,6 +1403,19 @@ mod tests {
         .expect("insert admin token");
 
         bearer_headers("admin")
+    }
+
+    async fn mark_initialized(pool: &PgPool) {
+        sqlx::query(
+            r#"
+            UPDATE system_state
+            SET initialized_at = NOW(), updated_at = NOW()
+            WHERE id = 1
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("mark initialized");
     }
 
     fn bearer_headers(token: &str) -> HeaderMap {
