@@ -124,5 +124,25 @@ pub struct SystemInitStatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInitResponse {
     pub root_token: String,
+    pub recovery_key: String,
     pub initialized_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemRootRotateResponse {
+    pub root_token: String,
+    pub recovery_key: String,
+    pub rotated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemRootRecoverRequest {
+    pub recovery_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemRootRecoverResponse {
+    pub root_token: String,
+    pub recovery_key: String,
+    pub recovered_at: DateTime<Utc>,
 }
