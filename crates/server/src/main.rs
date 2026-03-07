@@ -109,6 +109,7 @@ struct ServiceTokenRow {
 struct TokenPolicyRow {
     mount: String,
     path_prefix: String,
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -121,6 +122,44 @@ struct SystemStateRow {
 struct AuthContext {
     token_id: Uuid,
     is_admin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyCapability {
+    Read,
+    List,
+    Write,
+    Delete,
+    Undelete,
+    Destroy,
+    TokenAdmin,
+}
+
+impl PolicyCapability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::List => "list",
+            Self::Write => "write",
+            Self::Delete => "delete",
+            Self::Undelete => "undelete",
+            Self::Destroy => "destroy",
+            Self::TokenAdmin => "token_admin",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "read" => Some(Self::Read),
+            "list" => Some(Self::List),
+            "write" => Some(Self::Write),
+            "delete" => Some(Self::Delete),
+            "undelete" => Some(Self::Undelete),
+            "destroy" => Some(Self::Destroy),
+            "token_admin" => Some(Self::TokenAdmin),
+            _ => None,
+        }
+    }
 }
 
 impl From<SecretRow> for SecretMetadata {
@@ -539,7 +578,7 @@ async fn list_tokens(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<TokenListResponse>, ApiError> {
     let request_id = request_id_from_headers(&headers);
-    let auth = authorize_admin(&headers, &state).await;
+    let auth = authorize_capability_global(&headers, &state, PolicyCapability::TokenAdmin).await;
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
@@ -626,7 +665,7 @@ async fn create_token(
     Json(payload): Json<TokenCreateRequest>,
 ) -> std::result::Result<Json<TokenCreateResponse>, ApiError> {
     let request_id = request_id_from_headers(&headers);
-    let auth = authorize_admin(&headers, &state).await;
+    let auth = authorize_capability_global(&headers, &state, PolicyCapability::TokenAdmin).await;
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
@@ -673,9 +712,11 @@ async fn create_token(
                 return Err(ApiError::bad_request("token scope mount cannot be empty"));
             }
 
+            let capabilities = normalize_policy_capabilities(scope.capabilities)?;
             scopes.push(TokenScope {
                 mount,
                 path_prefix: normalize_path_prefix(&scope.path_prefix),
+                capabilities,
             });
         }
 
@@ -700,14 +741,22 @@ async fn create_token(
         for scope in &scopes {
             sqlx::query(
                 r#"
-                INSERT INTO service_token_policies (token_id, mount, path_prefix)
-                VALUES ($1, $2, $3)
-                ON CONFLICT DO NOTHING
+                INSERT INTO service_token_policies (token_id, mount, path_prefix, capabilities)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (token_id, mount, path_prefix)
+                DO UPDATE SET capabilities = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT capability
+                        FROM unnest(service_token_policies.capabilities || EXCLUDED.capabilities) AS capability
+                        ORDER BY capability
+                    )
+                )
                 "#,
             )
             .bind(token_id)
             .bind(&scope.mount)
             .bind(&scope.path_prefix)
+            .bind(&scope.capabilities)
             .execute(&state.pool)
             .await?;
         }
@@ -781,7 +830,8 @@ async fn list_secrets(
 ) -> std::result::Result<Json<SecretListResponse>, ApiError> {
     let request_id = request_id_from_headers(&headers);
     let prefix = normalize_path_prefix(query.prefix.as_deref().unwrap_or_default());
-    let auth = authorize_path(&headers, &state, &mount, &prefix).await;
+    let auth =
+        authorize_capability(&headers, &state, PolicyCapability::List, &mount, &prefix).await;
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
@@ -880,7 +930,14 @@ async fn read_secret(
 ) -> std::result::Result<Json<SecretReadResponse>, ApiError> {
     let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = authorize_capability(
+        &headers,
+        &state,
+        PolicyCapability::Read,
+        &mount,
+        &secret_path,
+    )
+    .await;
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
@@ -990,7 +1047,14 @@ async fn read_secret_metadata(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<SecretMetadataResponse>, ApiError> {
     let (secret_path, key) = split_secret_path(&path)?;
-    authorize_path(&headers, &state, &mount, &secret_path).await?;
+    authorize_capability(
+        &headers,
+        &state,
+        PolicyCapability::Read,
+        &mount,
+        &secret_path,
+    )
+    .await?;
 
     let rows = load_all_secret_versions(&state.pool, &mount, &secret_path, &key).await?;
     if rows.is_empty() {
@@ -1031,7 +1095,14 @@ async fn write_secret(
 ) -> std::result::Result<Json<SecretWriteResponse>, ApiError> {
     let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = authorize_capability(
+        &headers,
+        &state,
+        PolicyCapability::Write,
+        &mount,
+        &secret_path,
+    )
+    .await;
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
@@ -1147,7 +1218,14 @@ async fn delete_secret(
 ) -> std::result::Result<StatusCode, ApiError> {
     let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = authorize_capability(
+        &headers,
+        &state,
+        PolicyCapability::Delete,
+        &mount,
+        &secret_path,
+    )
+    .await;
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
@@ -1245,7 +1323,14 @@ async fn undelete_secret(
 ) -> std::result::Result<StatusCode, ApiError> {
     let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = authorize_capability(
+        &headers,
+        &state,
+        PolicyCapability::Undelete,
+        &mount,
+        &secret_path,
+    )
+    .await;
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
@@ -1338,7 +1423,14 @@ async fn destroy_secret(
 ) -> std::result::Result<StatusCode, ApiError> {
     let request_id = request_id_from_headers(&headers);
     let (secret_path, key) = split_secret_path(&path)?;
-    let auth = authorize_path(&headers, &state, &mount, &secret_path).await;
+    let auth = authorize_capability(
+        &headers,
+        &state,
+        PolicyCapability::Destroy,
+        &mount,
+        &secret_path,
+    )
+    .await;
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
@@ -1428,7 +1520,7 @@ async fn delete_token(
     State(state): State<AppState>,
 ) -> std::result::Result<StatusCode, ApiError> {
     let request_id = request_id_from_headers(&headers);
-    let auth = authorize_admin(&headers, &state).await;
+    let auth = authorize_capability_global(&headers, &state, PolicyCapability::TokenAdmin).await;
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
@@ -1632,7 +1724,7 @@ async fn load_token_metadata(
 ) -> std::result::Result<TokenMetadata, ApiError> {
     let scopes = sqlx::query_as::<_, TokenPolicyRow>(
         r#"
-        SELECT mount, path_prefix
+        SELECT mount, path_prefix, capabilities
         FROM service_token_policies
         WHERE token_id = $1
         ORDER BY mount ASC, path_prefix ASC
@@ -1645,6 +1737,7 @@ async fn load_token_metadata(
     .map(|scope| TokenScope {
         mount: scope.mount,
         path_prefix: scope.path_prefix,
+        capabilities: scope.capabilities,
     })
     .collect();
 
@@ -1692,17 +1785,6 @@ async fn load_root_token_id(pool: &PgPool) -> std::result::Result<Option<Uuid>, 
     .map_err(ApiError::from)
 }
 
-async fn authorize_admin(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> std::result::Result<AuthContext, ApiError> {
-    let auth = authenticate(headers, state).await?;
-    if !auth.is_admin {
-        return Err(ApiError::forbidden("admin token required"));
-    }
-    Ok(auth)
-}
-
 async fn authorize_root(
     headers: &HeaderMap,
     state: &AppState,
@@ -1719,9 +1801,42 @@ async fn authorize_root(
     Ok(auth)
 }
 
-async fn authorize_path(
+async fn authorize_capability_global(
     headers: &HeaderMap,
     state: &AppState,
+    capability: PolicyCapability,
+) -> std::result::Result<AuthContext, ApiError> {
+    let auth = authenticate(headers, state).await?;
+    if auth.is_admin {
+        return Ok(auth);
+    }
+
+    let allowed = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM service_token_policies
+            WHERE token_id = $1
+              AND $2 = ANY(capabilities)
+        )
+        "#,
+    )
+    .bind(auth.token_id)
+    .bind(capability.as_str())
+    .fetch_one(&state.pool)
+    .await?;
+
+    if !allowed {
+        return Err(ApiError::forbidden("token is not allowed for this action"));
+    }
+
+    Ok(auth)
+}
+
+async fn authorize_capability(
+    headers: &HeaderMap,
+    state: &AppState,
+    capability: PolicyCapability,
     mount: &str,
     path: &str,
 ) -> std::result::Result<AuthContext, ApiError> {
@@ -1737,6 +1852,7 @@ async fn authorize_path(
             FROM service_token_policies
             WHERE token_id = $1
               AND mount = $2
+              AND $4 = ANY(capabilities)
               AND (
                 path_prefix = ''
                 OR $3 = path_prefix
@@ -1748,11 +1864,14 @@ async fn authorize_path(
     .bind(auth.token_id)
     .bind(mount)
     .bind(normalize_path_prefix(path))
+    .bind(capability.as_str())
     .fetch_one(&state.pool)
     .await?;
 
     if !allowed {
-        return Err(ApiError::forbidden("token is not allowed for this path"));
+        return Err(ApiError::forbidden(
+            "token is not allowed for this action/path",
+        ));
     }
 
     Ok(auth)
@@ -1817,6 +1936,37 @@ fn split_secret_path(raw: &str) -> std::result::Result<(String, String), ApiErro
 
 fn normalize_path_prefix(value: &str) -> String {
     value.trim_matches('/').to_string()
+}
+
+fn normalize_policy_capabilities(
+    values: Vec<String>,
+) -> std::result::Result<Vec<String>, ApiError> {
+    let mut capabilities: Vec<String> = if values.is_empty() {
+        vec![
+            PolicyCapability::Read.as_str().to_string(),
+            PolicyCapability::List.as_str().to_string(),
+            PolicyCapability::Write.as_str().to_string(),
+            PolicyCapability::Delete.as_str().to_string(),
+            PolicyCapability::Undelete.as_str().to_string(),
+            PolicyCapability::Destroy.as_str().to_string(),
+        ]
+    } else {
+        let mut normalized = Vec::with_capacity(values.len());
+        for capability in values {
+            let value = capability.trim().to_string();
+            if value.is_empty() {
+                return Err(ApiError::bad_request("policy capability cannot be empty"));
+            }
+            let _ = PolicyCapability::from_str(&value)
+                .ok_or_else(|| ApiError::bad_request(format!("unsupported capability: {value}")))?;
+            normalized.push(value);
+        }
+        normalized
+    };
+
+    capabilities.sort();
+    capabilities.dedup();
+    Ok(capabilities)
 }
 
 fn normalize_requested_versions(values: Vec<i32>) -> std::result::Result<Vec<i32>, ApiError> {
@@ -1993,9 +2143,10 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, ListQuery, ReadQuery, SecretVersionActionRequest, SecretWriteRequest,
-        authorize_path, create_token, delete_secret, delete_token, destroy_secret, hash_token,
-        init_system, list_secrets, list_tokens, normalize_path_prefix,
+        AppState, ListQuery, PolicyCapability, ReadQuery, SecretVersionActionRequest,
+        SecretWriteRequest, authorize_capability, authorize_capability_global, create_token,
+        delete_secret, delete_token, destroy_secret, hash_token, init_system, list_secrets,
+        list_tokens, normalize_path_prefix, normalize_policy_capabilities,
         normalize_requested_versions, read_secret, read_secret_metadata, read_system_init_status,
         recover_root, revoke_root, rotate_root, split_secret_path, undelete_secret, validate_token,
         write_secret,
@@ -2062,6 +2213,22 @@ mod tests {
 
         let non_positive = normalize_requested_versions(vec![1, 0]).expect_err("0 should fail");
         assert_eq!(non_positive.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn normalize_policy_capabilities_defaults_to_kv_capabilities() {
+        let capabilities = normalize_policy_capabilities(vec![]).expect("should default");
+        assert_eq!(
+            capabilities,
+            vec!["delete", "destroy", "list", "read", "undelete", "write"]
+        );
+    }
+
+    #[test]
+    fn normalize_policy_capabilities_rejects_unknown_capabilities() {
+        let error = normalize_policy_capabilities(vec!["do-anything".to_string()])
+            .expect_err("unknown capability should fail");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2215,7 +2382,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn authorize_path_enforces_token_scope(pool: PgPool) {
+    async fn authorize_capability_enforces_action_and_scope(pool: PgPool) {
         let state = test_state(pool.clone());
         mark_initialized(&pool).await;
 
@@ -2235,8 +2402,8 @@ mod tests {
 
         sqlx::query(
             r#"
-            INSERT INTO service_token_policies (token_id, mount, path_prefix)
-            VALUES ($1, 'kv', 'apps/demo')
+            INSERT INTO service_token_policies (token_id, mount, path_prefix, capabilities)
+            VALUES ($1, 'kv', 'apps/demo', ARRAY['read']::text[])
             "#,
         )
         .bind(token_id)
@@ -2245,14 +2412,63 @@ mod tests {
         .expect("insert policy");
 
         let headers = bearer_headers("scoped");
-        authorize_path(&headers, &state, "kv", "apps/demo/feature")
-            .await
-            .expect("path should be allowed");
+        authorize_capability(
+            &headers,
+            &state,
+            PolicyCapability::Read,
+            "kv",
+            "apps/demo/feature",
+        )
+        .await
+        .expect("path should be allowed");
 
-        let denied = authorize_path(&headers, &state, "kv", "apps/prod")
+        let denied_path =
+            authorize_capability(&headers, &state, PolicyCapability::Read, "kv", "apps/prod")
+                .await
+                .expect_err("path should be denied");
+        assert_eq!(denied_path.status, StatusCode::FORBIDDEN);
+
+        let denied_action =
+            authorize_capability(&headers, &state, PolicyCapability::Write, "kv", "apps/demo")
+                .await
+                .expect_err("action should be denied");
+        assert_eq!(denied_action.status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn token_admin_capability_allows_token_management(pool: PgPool) {
+        let state = test_state(pool.clone());
+        mark_initialized(&pool).await;
+
+        let token_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO service_tokens (id, label, token_hash, is_admin)
+            VALUES ($1, $2, $3, FALSE)
+            "#,
+        )
+        .bind(token_id)
+        .bind("token-operator")
+        .bind(hash_token("operator"))
+        .execute(&pool)
+        .await
+        .expect("insert operator token");
+
+        sqlx::query(
+            r#"
+            INSERT INTO service_token_policies (token_id, mount, path_prefix, capabilities)
+            VALUES ($1, 'sys', '', ARRAY['token_admin']::text[])
+            "#,
+        )
+        .bind(token_id)
+        .execute(&pool)
+        .await
+        .expect("insert token-admin policy");
+
+        let headers = bearer_headers("operator");
+        authorize_capability_global(&headers, &state, PolicyCapability::TokenAdmin)
             .await
-            .expect_err("path should be denied");
-        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+            .expect("token admin should be granted");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2422,6 +2638,7 @@ mod tests {
                 scopes: vec![TokenScope {
                     mount: "kv".to_string(),
                     path_prefix: "apps".to_string(),
+                    capabilities: vec!["read".to_string(), "write".to_string()],
                 }],
             }),
         )
