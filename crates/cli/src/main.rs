@@ -1,12 +1,15 @@
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use reqwest::{Client, Method, StatusCode};
 use secret_engine_core::model::{
     SecretListResponse, SecretMetadataResponse, SecretReadResponse, SecretVersionActionRequest,
     SecretWriteRequest, SecretWriteResponse, SystemInitResponse, SystemInitStatusResponse,
     SystemRootRecoverRequest, SystemRootRecoverResponse, SystemRootRotateResponse,
+    TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenScope,
 };
 use url::Url;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,6 +41,10 @@ enum Commands {
     Kv {
         #[command(subcommand)]
         command: KvCommand,
+    },
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
     },
 }
 
@@ -81,6 +88,13 @@ enum KvCommand {
     List(KvListArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum TokenCommand {
+    List,
+    Create(TokenCreateArgs),
+    Delete(TokenDeleteArgs),
+}
+
 #[derive(Debug, Args)]
 struct KvPutArgs {
     #[arg(long, default_value = "kv")]
@@ -122,6 +136,23 @@ struct KvVersionActionArgs {
     path: String,
 }
 
+#[derive(Debug, Args)]
+struct TokenCreateArgs {
+    #[arg(long)]
+    label: String,
+    #[arg(long, default_value_t = false)]
+    admin: bool,
+    #[arg(long)]
+    expires_at: Option<String>,
+    #[arg(long = "policy")]
+    policies: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct TokenDeleteArgs {
+    token_id: Uuid,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -149,6 +180,11 @@ async fn main() -> Result<()> {
             KvCommand::Destroy(args) => api.kv_destroy(args).await?,
             KvCommand::Delete(args) => api.kv_delete(args).await?,
             KvCommand::List(args) => api.kv_list(args).await?,
+        },
+        Commands::Token { command } => match command {
+            TokenCommand::List => api.token_list().await?,
+            TokenCommand::Create(args) => api.token_create(args).await?,
+            TokenCommand::Delete(args) => api.token_delete(args).await?,
         },
     }
 
@@ -247,6 +283,69 @@ impl Api {
         println!("new root token: {}", response.root_token);
         println!("new recovery key: {}", response.recovery_key);
         println!("export SECRET_ENGINE_TOKEN={}", response.root_token);
+        Ok(())
+    }
+
+    async fn token_list(&self) -> Result<()> {
+        let response: TokenListResponse = self
+            .send::<()>(Method::GET, "/api/v1/tokens", None)
+            .await?
+            .json()
+            .await?;
+
+        for item in response.items {
+            println!(
+                "{} {} admin={} expires_at={}",
+                item.id,
+                item.label,
+                item.admin,
+                item.expires_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            for scope in item.scopes {
+                println!(
+                    "  policy mount={} path_prefix={} capabilities={}",
+                    scope.mount,
+                    scope.path_prefix,
+                    scope.capabilities.join(",")
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn token_create(&self, args: TokenCreateArgs) -> Result<()> {
+        let expires_at = parse_optional_datetime(args.expires_at.as_deref())?;
+        let scopes = parse_policies(&args.policies)?;
+        let payload = TokenCreateRequest {
+            label: args.label,
+            admin: args.admin,
+            expires_at,
+            scopes,
+        };
+
+        let response: TokenCreateResponse = self
+            .send(Method::POST, "/api/v1/tokens", Some(&payload))
+            .await?
+            .json()
+            .await?;
+
+        println!("token: {}", response.token);
+        println!("token id: {}", response.metadata.id);
+        println!("label: {}", response.metadata.label);
+        println!("admin: {}", response.metadata.admin);
+        Ok(())
+    }
+
+    async fn token_delete(&self, args: TokenDeleteArgs) -> Result<()> {
+        let path = format!("/api/v1/tokens/{}", args.token_id);
+        let response = self.send::<()>(Method::DELETE, &path, None).await?;
+        if response.status() != StatusCode::NO_CONTENT {
+            bail!("token delete failed: {}", response.status());
+        }
+        println!("deleted token {}", args.token_id);
         Ok(())
     }
 
@@ -419,4 +518,46 @@ impl Api {
         }
         Ok(url)
     }
+}
+
+fn parse_optional_datetime(raw: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    match raw {
+        Some(value) => {
+            let parsed = DateTime::parse_from_rfc3339(value)
+                .with_context(|| format!("invalid --expires-at value: {value}"))?;
+            Ok(Some(parsed.with_timezone(&Utc)))
+        }
+        None => Ok(None),
+    }
+}
+
+fn parse_policies(values: &[String]) -> Result<Vec<TokenScope>> {
+    let mut scopes = Vec::with_capacity(values.len());
+    for value in values {
+        let parts: Vec<&str> = value.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            bail!("invalid --policy format: {value} (expected mount:path_prefix:cap1,cap2)");
+        }
+
+        let mount = parts[0].trim();
+        if mount.is_empty() {
+            bail!("policy mount cannot be empty");
+        }
+
+        let path_prefix = parts[1].trim().trim_matches('/').to_string();
+        let capabilities = parts[2]
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        scopes.push(TokenScope {
+            mount: mount.to_string(),
+            path_prefix,
+            capabilities,
+        });
+    }
+
+    Ok(scopes)
 }
