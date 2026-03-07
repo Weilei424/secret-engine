@@ -97,6 +97,9 @@ cargo run -p secret-engine-cli -- kv put apps/demo/password super-secret
 cargo run -p secret-engine-cli -- kv get apps/demo/password
 cargo run -p secret-engine-cli -- kv list --prefix apps/
 cargo run -p secret-engine-cli -- kv delete apps/demo/password
+cargo run -p secret-engine-cli -- token list
+cargo run -p secret-engine-cli -- token create --label app-reader --policy kv:apps/prod:read,list
+cargo run -p secret-engine-cli -- token delete <token-id>
 ```
 
 ### Run the web UI directly

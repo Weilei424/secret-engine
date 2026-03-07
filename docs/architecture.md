@@ -159,8 +159,8 @@ The upgrade path is preserved by the `SecretCipher` trait in `crates/core`, whic
 
 - Explicit init flow that mints a root token once.
 - No user identities.
-- No policy enforcement.
-- No audit trail.
+- Capability-aware token policies by mount/path prefix (`read`, `list`, `write`, `delete`, `undelete`, `destroy`, `token_admin`).
+- Durable audit logging with request IDs for auth, KV, and token management flows.
 - Service token issuance is available, with optional expiry.
 
 ### Intended future direction
