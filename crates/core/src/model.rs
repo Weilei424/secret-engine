@@ -82,6 +82,8 @@ pub struct SecretVersionActionRequest {
 pub struct TokenScope {
     pub mount: String,
     pub path_prefix: String,
+    #[serde(default = "default_policy_capabilities")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +115,17 @@ pub struct TokenCreateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenListResponse {
     pub items: Vec<TokenMetadata>,
+}
+
+fn default_policy_capabilities() -> Vec<String> {
+    vec![
+        "read".to_string(),
+        "list".to_string(),
+        "write".to_string(),
+        "delete".to_string(),
+        "undelete".to_string(),
+        "destroy".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
