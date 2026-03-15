@@ -82,6 +82,12 @@ The design goal is to keep the initial system simple while leaving room for stro
   - Revokes current root token.
 - `POST /api/v1/sys/root/recover`
   - Recovers root token using recovery key.
+- `GET /api/v1/sys/keys`
+  - Returns encryption key metadata, active key ID, and remaining stale ciphertext count.
+- `POST /api/v1/sys/keys/rotate`
+  - Creates and activates a new encryption key ID for future writes.
+- `POST /api/v1/sys/keys/reencrypt`
+  - Re-encrypts a batch of older ciphertext rows onto the active key.
 - `GET /api/v1/auth/validate`
   - Confirms that the supplied bearer token is accepted.
 
@@ -117,6 +123,7 @@ The current PostgreSQL schema stores versioned secret rows with:
 - `path`
 - `secret_key`
 - `encrypted_value`
+- `key_id`
 - `cipher_algorithm`
 - `version`
 - `deleted_at` for soft-deleted current versions
@@ -130,6 +137,7 @@ This schema is intentionally narrow. It supports the current KV use case and kee
 
 - token tables
 - policy tables
+- encryption key metadata
 - versioned secret history
 - audit/event logs
 - mounts beyond KV
@@ -139,10 +147,17 @@ This schema is intentionally narrow. It supports the current KV use case and kee
 The current implementation uses:
 
 - AES-256-GCM
-- a master key derived from a configured passphrase using Argon2id for new writes
+- a master key derived from a configured passphrase using Argon2id for managed key IDs
+- an `encryption_keys` table with one active key for new writes and retained inactive keys for reads
 - legacy SHA-256-derived ciphertext remains readable during migration
 - a random nonce per secret write
-- a serialized envelope containing a versioned algorithm identifier and base64 payload
+- a serialized envelope containing `key_id`, a versioned algorithm identifier, and a base64 payload
+
+Rotation behavior:
+
+- New secret writes always use the active `key_id` from PostgreSQL.
+- Rotating keys changes only the active `key_id`; existing ciphertext remains readable.
+- Re-encryption is an explicit batch operation that rewrites older ciphertext in place onto the active key without changing secret versions.
 
 This is acceptable for an MVP, but it is not the long-term target for a production-grade secret engine.
 

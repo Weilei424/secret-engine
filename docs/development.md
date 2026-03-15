@@ -93,6 +93,9 @@ cargo run -p secret-engine-cli -- sys status
 cargo run -p secret-engine-cli -- sys root rotate
 cargo run -p secret-engine-cli -- sys root revoke
 cargo run -p secret-engine-cli -- sys root recover --recovery-key REPLACE_WITH_RECOVERY_KEY
+cargo run -p secret-engine-cli -- sys keys status
+cargo run -p secret-engine-cli -- sys keys rotate
+cargo run -p secret-engine-cli -- sys keys reencrypt --batch-size 100
 cargo run -p secret-engine-cli -- kv put apps/demo/password super-secret
 cargo run -p secret-engine-cli -- kv get apps/demo/password
 cargo run -p secret-engine-cli -- kv list --prefix apps/
@@ -101,6 +104,12 @@ cargo run -p secret-engine-cli -- token list
 cargo run -p secret-engine-cli -- token create --label app-reader --policy kv:apps/prod:read,list
 cargo run -p secret-engine-cli -- token delete <token-id>
 ```
+
+Key rotation notes:
+
+- `sys keys rotate` creates a new active encryption key ID for future writes.
+- Existing secret versions remain readable after rotation because the server derives keys by stored `key_id`.
+- `sys keys reencrypt` rewrites older ciphertext in batches onto the current active key without changing secret versions.
 
 ### Run the web UI directly
 
