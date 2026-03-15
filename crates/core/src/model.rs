@@ -55,6 +55,7 @@ pub struct SecretWriteResponse {
     pub path: String,
     pub key: String,
     pub version: i32,
+    pub key_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,4 +159,42 @@ pub struct SystemRootRecoverResponse {
     pub root_token: String,
     pub recovery_key: String,
     pub recovered_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemEncryptionKey {
+    pub key_id: String,
+    pub derivation_algorithm: String,
+    pub created_at: DateTime<Utc>,
+    pub activated_at: DateTime<Utc>,
+    pub deactivated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemKeyStatusResponse {
+    pub active_key_id: String,
+    pub keys: Vec<SystemEncryptionKey>,
+    pub stale_ciphertext_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemKeyRotateResponse {
+    pub active_key: SystemEncryptionKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemKeyReencryptRequest {
+    #[serde(default = "default_reencrypt_batch_size")]
+    pub batch_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemKeyReencryptResponse {
+    pub active_key_id: String,
+    pub reencrypted_count: i64,
+    pub remaining_count: i64,
+}
+
+fn default_reencrypt_batch_size() -> i64 {
+    100
 }
