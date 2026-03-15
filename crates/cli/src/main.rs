@@ -5,8 +5,10 @@ use reqwest::{Client, Method, StatusCode};
 use secret_engine_core::model::{
     SecretListResponse, SecretMetadataResponse, SecretReadResponse, SecretVersionActionRequest,
     SecretWriteRequest, SecretWriteResponse, SystemInitResponse, SystemInitStatusResponse,
-    SystemRootRecoverRequest, SystemRootRecoverResponse, SystemRootRotateResponse,
-    TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenScope,
+    SystemKeyReencryptRequest, SystemKeyReencryptResponse, SystemKeyRotateResponse,
+    SystemKeyStatusResponse, SystemRootRecoverRequest, SystemRootRecoverResponse,
+    SystemRootRotateResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse,
+    TokenScope,
 };
 use url::Url;
 use uuid::Uuid;
@@ -52,10 +54,21 @@ enum Commands {
 enum SysCommand {
     Init,
     Status,
+    Keys {
+        #[command(subcommand)]
+        command: SysKeyCommand,
+    },
     Root {
         #[command(subcommand)]
         command: SysRootCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SysKeyCommand {
+    Status,
+    Rotate,
+    Reencrypt(SysKeyReencryptArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +82,12 @@ enum SysRootCommand {
 struct SysRecoverArgs {
     #[arg(long)]
     recovery_key: String,
+}
+
+#[derive(Debug, Args)]
+struct SysKeyReencryptArgs {
+    #[arg(long, default_value_t = 100)]
+    batch_size: i64,
 }
 
 #[derive(Debug, Args)]
@@ -166,6 +185,11 @@ async fn main() -> Result<()> {
         Commands::Sys { command } => match command {
             SysCommand::Init => api.sys_init().await?,
             SysCommand::Status => api.sys_status().await?,
+            SysCommand::Keys { command } => match command {
+                SysKeyCommand::Status => api.sys_keys_status().await?,
+                SysKeyCommand::Rotate => api.sys_keys_rotate().await?,
+                SysKeyCommand::Reencrypt(args) => api.sys_keys_reencrypt(args).await?,
+            },
             SysCommand::Root { command } => match command {
                 SysRootCommand::Rotate => api.sys_root_rotate().await?,
                 SysRootCommand::Revoke => api.sys_root_revoke().await?,
@@ -286,6 +310,58 @@ impl Api {
         Ok(())
     }
 
+    async fn sys_keys_status(&self) -> Result<()> {
+        let response: SystemKeyStatusResponse = self
+            .send::<()>(Method::GET, "/api/v1/sys/keys", None)
+            .await?
+            .json()
+            .await?;
+
+        println!("active key: {}", response.active_key_id);
+        println!("stale ciphertext rows: {}", response.stale_ciphertext_count);
+        for key in response.keys {
+            let state = if key.deactivated_at.is_some() {
+                "inactive"
+            } else {
+                "active"
+            };
+            println!(
+                "{} {} created_at={} activated_at={}",
+                key.key_id, state, key.created_at, key.activated_at
+            );
+        }
+        Ok(())
+    }
+
+    async fn sys_keys_rotate(&self) -> Result<()> {
+        let response: SystemKeyRotateResponse = self
+            .send::<()>(Method::POST, "/api/v1/sys/keys/rotate", None)
+            .await?
+            .json()
+            .await?;
+
+        println!("active key rotated to {}", response.active_key.key_id);
+        println!("activated at {}", response.active_key.activated_at);
+        Ok(())
+    }
+
+    async fn sys_keys_reencrypt(&self, args: SysKeyReencryptArgs) -> Result<()> {
+        let payload = SystemKeyReencryptRequest {
+            batch_size: args.batch_size,
+        };
+        let response: SystemKeyReencryptResponse = self
+            .send(Method::POST, "/api/v1/sys/keys/reencrypt", Some(&payload))
+            .await?
+            .json()
+            .await?;
+
+        println!(
+            "reencrypted {} rows to {} ({} remaining)",
+            response.reencrypted_count, response.active_key_id, response.remaining_count
+        );
+        Ok(())
+    }
+
     async fn token_list(&self) -> Result<()> {
         let response: TokenListResponse = self
             .send::<()>(Method::GET, "/api/v1/tokens", None)
@@ -359,8 +435,8 @@ impl Api {
             .await?;
 
         println!(
-            "stored {}/{}/{} (version {})",
-            response.mount, response.path, response.key, response.version
+            "stored {}/{}/{} (version {}, key {})",
+            response.mount, response.path, response.key, response.version, response.key_id
         );
         Ok(())
     }
