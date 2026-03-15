@@ -29,42 +29,61 @@ pub enum CryptoError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CiphertextEnvelope {
+    pub key_id: String,
     pub algorithm: String,
     pub payload: String,
 }
 
 #[async_trait]
 pub trait SecretCipher: Send + Sync {
-    async fn encrypt(&self, plaintext: &str) -> Result<CiphertextEnvelope, CryptoError>;
+    async fn encrypt(
+        &self,
+        plaintext: &str,
+        key_id: &str,
+    ) -> Result<CiphertextEnvelope, CryptoError>;
     async fn decrypt(&self, envelope: &CiphertextEnvelope) -> Result<String, CryptoError>;
 }
 
 #[derive(Debug, Clone)]
 pub struct AesGcmCipher {
-    current_key: [u8; 32],
+    passphrase: String,
     legacy_key: [u8; 32],
-    current_algorithm: String,
 }
 
 impl AesGcmCipher {
     pub fn from_passphrase(passphrase: &str) -> Result<Self, CryptoError> {
-        let mut current_key = [0_u8; 32];
-        let params =
-            Params::new(64 * 1024, 3, 1, Some(32)).map_err(|_| CryptoError::KeyDerivation)?;
-        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        argon2
-            .hash_password_into(passphrase.as_bytes(), KDF_SALT, &mut current_key)
-            .map_err(|_| CryptoError::KeyDerivation)?;
-
         let digest = Sha256::digest(passphrase.as_bytes());
         let mut legacy_key = [0_u8; 32];
         legacy_key.copy_from_slice(&digest);
 
         Ok(Self {
-            current_key,
+            passphrase: passphrase.to_string(),
             legacy_key,
-            current_algorithm: format!("{CURRENT_ALGORITHM}:{CURRENT_KEY_ID}"),
         })
+    }
+
+    pub fn default_key_id() -> &'static str {
+        CURRENT_KEY_ID
+    }
+
+    pub fn current_algorithm_for(key_id: &str) -> String {
+        format!("{CURRENT_ALGORITHM}:{key_id}")
+    }
+
+    fn derive_current_key(&self, key_id: &str) -> Result<[u8; 32], CryptoError> {
+        let mut key = [0_u8; 32];
+        let params =
+            Params::new(64 * 1024, 3, 1, Some(32)).map_err(|_| CryptoError::KeyDerivation)?;
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+        let mut salt = KDF_SALT.to_vec();
+        salt.push(b':');
+        salt.extend_from_slice(key_id.as_bytes());
+
+        argon2
+            .hash_password_into(self.passphrase.as_bytes(), &salt, &mut key)
+            .map_err(|_| CryptoError::KeyDerivation)?;
+        Ok(key)
     }
 
     fn engine(key_bytes: &[u8; 32]) -> Aes256Gcm {
@@ -91,6 +110,9 @@ impl AesGcmCipher {
         combined.extend_from_slice(&encrypted);
 
         Ok(CiphertextEnvelope {
+            key_id: key_id_from_algorithm(algorithm)
+                .unwrap_or(CURRENT_KEY_ID)
+                .to_string(),
             algorithm: algorithm.to_string(),
             payload: BASE64.encode(combined),
         })
@@ -123,27 +145,38 @@ impl AesGcmCipher {
             return Some(&self.legacy_key);
         }
 
-        if algorithm == self.current_algorithm {
-            return Some(&self.current_key);
-        }
-
         None
     }
 }
 
 #[async_trait]
 impl SecretCipher for AesGcmCipher {
-    async fn encrypt(&self, plaintext: &str) -> Result<CiphertextEnvelope, CryptoError> {
-        self.encrypt_with_key(plaintext, &self.current_key, &self.current_algorithm)
+    async fn encrypt(
+        &self,
+        plaintext: &str,
+        key_id: &str,
+    ) -> Result<CiphertextEnvelope, CryptoError> {
+        let key = self.derive_current_key(key_id)?;
+        self.encrypt_with_key(plaintext, &key, &Self::current_algorithm_for(key_id))
     }
 
     async fn decrypt(&self, envelope: &CiphertextEnvelope) -> Result<String, CryptoError> {
-        let key = self
-            .key_for_algorithm(&envelope.algorithm)
-            .ok_or(CryptoError::InvalidPayload)?;
+        if let Some(key) = self.key_for_algorithm(&envelope.algorithm) {
+            return self.decrypt_with_key(envelope, key);
+        }
 
-        self.decrypt_with_key(envelope, key)
+        let expected_algorithm = Self::current_algorithm_for(&envelope.key_id);
+        if envelope.algorithm != expected_algorithm {
+            return Err(CryptoError::InvalidPayload);
+        }
+
+        let key = self.derive_current_key(&envelope.key_id)?;
+        self.decrypt_with_key(envelope, &key)
     }
+}
+
+fn key_id_from_algorithm(algorithm: &str) -> Option<&str> {
+    algorithm.split_once(':').map(|(_, key_id)| key_id)
 }
 
 #[cfg(test)]
@@ -153,14 +186,22 @@ mod tests {
     #[test]
     fn encrypt_uses_versioned_argon2id_algorithm() {
         let cipher = AesGcmCipher::from_passphrase("test-passphrase").expect("cipher");
+        let key = cipher
+            .derive_current_key(AesGcmCipher::default_key_id())
+            .expect("derive current key");
         let envelope = cipher
-            .encrypt_with_key("secret", &cipher.current_key, &cipher.current_algorithm)
+            .encrypt_with_key(
+                "secret",
+                &key,
+                &AesGcmCipher::current_algorithm_for(AesGcmCipher::default_key_id()),
+            )
             .expect("encrypt");
 
         assert_eq!(
             envelope.algorithm,
             "aes-256-gcm+argon2id-v1:static-passphrase-v1"
         );
+        assert_eq!(envelope.key_id, "static-passphrase-v1");
     }
 
     #[test]
@@ -174,5 +215,21 @@ mod tests {
             .expect("decrypt");
 
         assert_eq!(plaintext, "secret");
+    }
+
+    #[test]
+    fn decrypt_supports_rotated_key_ids() {
+        let cipher = AesGcmCipher::from_passphrase("test-passphrase").expect("cipher");
+        let key = cipher
+            .derive_current_key("key-20260314")
+            .expect("derive current key");
+        let envelope = cipher
+            .encrypt_with_key("secret", &key, "aes-256-gcm+argon2id-v1:key-20260314")
+            .expect("encrypt");
+        let plaintext = cipher.decrypt_with_key(&envelope, &key).expect("decrypt");
+
+        assert_eq!(plaintext, "secret");
+        assert_eq!(envelope.algorithm, "aes-256-gcm+argon2id-v1:key-20260314");
+        assert_eq!(envelope.key_id, "key-20260314");
     }
 }
