@@ -16,14 +16,16 @@ use secret_engine_core::{
     model::{
         SecretListResponse, SecretMetadata, SecretMetadataResponse, SecretReadResponse,
         SecretVersionActionRequest, SecretVersionMetadata, SecretWriteRequest, SecretWriteResponse,
-        SystemInitResponse, SystemInitStatusResponse, SystemRootRecoverRequest,
-        SystemRootRecoverResponse, SystemRootRotateResponse, TokenCreateRequest,
-        TokenCreateResponse, TokenListResponse, TokenMetadata, TokenScope,
+        SystemEncryptionKey, SystemInitResponse, SystemInitStatusResponse,
+        SystemKeyReencryptRequest, SystemKeyReencryptResponse, SystemKeyRotateResponse,
+        SystemKeyStatusResponse, SystemRootRecoverRequest, SystemRootRecoverResponse,
+        SystemRootRotateResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse,
+        TokenMetadata, TokenScope,
     },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
+use sqlx::{FromRow, PgPool, Postgres, Transaction, postgres::PgPoolOptions};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use uuid::Uuid;
@@ -88,6 +90,7 @@ struct SecretRow {
     path: String,
     secret_key: String,
     encrypted_value: String,
+    key_id: String,
     cipher_algorithm: String,
     version: i32,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -116,6 +119,27 @@ struct TokenPolicyRow {
 struct SystemStateRow {
     initialized_at: Option<chrono::DateTime<chrono::Utc>>,
     recovery_key_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct EncryptionKeyRow {
+    key_id: String,
+    derivation_algorithm: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    activated_at: chrono::DateTime<chrono::Utc>,
+    deactivated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<EncryptionKeyRow> for SystemEncryptionKey {
+    fn from(value: EncryptionKeyRow) -> Self {
+        Self {
+            key_id: value.key_id,
+            derivation_algorithm: value.derivation_algorithm,
+            created_at: value.created_at,
+            activated_at: value.activated_at,
+            deactivated_at: value.deactivated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +243,15 @@ async fn main() -> AnyResult<()> {
         .route(
             "/api/v1/sys/root/recover",
             axum::routing::post(recover_root),
+        )
+        .route("/api/v1/sys/keys", get(list_encryption_keys))
+        .route(
+            "/api/v1/sys/keys/rotate",
+            axum::routing::post(rotate_encryption_key),
+        )
+        .route(
+            "/api/v1/sys/keys/reencrypt",
+            axum::routing::post(reencrypt_secrets),
         )
         .route("/api/v1/auth/validate", get(validate_token))
         .route("/api/v1/tokens", get(list_tokens).post(create_token))
@@ -573,6 +606,323 @@ async fn recover_root(
     }))
 }
 
+async fn list_encryption_keys(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<SystemKeyStatusResponse>, ApiError> {
+    let request_id = request_id_from_headers(&headers);
+    let auth = authorize_root(&headers, &state).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "sys.keys.status",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+
+    let result: std::result::Result<Json<SystemKeyStatusResponse>, ApiError> = async {
+        let keys = load_encryption_keys(&state.pool).await?;
+        let active_key = keys
+            .iter()
+            .find(|row| row.deactivated_at.is_none())
+            .ok_or_else(|| ApiError::service_unavailable("active encryption key is missing"))?;
+        let stale_ciphertext_count =
+            count_stale_ciphertext(&state.pool, &active_key.key_id).await?;
+
+        Ok(Json(SystemKeyStatusResponse {
+            active_key_id: active_key.key_id.clone(),
+            keys: keys.into_iter().map(Into::into).collect(),
+            stale_ciphertext_count,
+        }))
+    }
+    .await;
+
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "sys.keys.status",
+                None,
+                None,
+                None,
+                true,
+                StatusCode::OK,
+                None,
+                serde_json::json!({
+                    "active_key_id": response.0.active_key_id,
+                    "stale_ciphertext_count": response.0.stale_ciphertext_count
+                }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "sys.keys.status",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(err)
+        }
+    }
+}
+
+async fn rotate_encryption_key(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<SystemKeyRotateResponse>, ApiError> {
+    let request_id = request_id_from_headers(&headers);
+    let auth = authorize_root(&headers, &state).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "sys.keys.rotate",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+
+    let result: std::result::Result<Json<SystemKeyRotateResponse>, ApiError> = async {
+        let mut tx = state.pool.begin().await?;
+        let active_key = load_active_encryption_key_for_update(&mut tx).await?;
+        let next_key = new_encryption_key_row();
+
+        sqlx::query(
+            r#"
+            UPDATE encryption_keys
+            SET deactivated_at = NOW()
+            WHERE key_id = $1
+              AND deactivated_at IS NULL
+            "#,
+        )
+        .bind(&active_key.key_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let inserted = sqlx::query_as::<_, EncryptionKeyRow>(
+            r#"
+            INSERT INTO encryption_keys (key_id, derivation_algorithm, created_at, activated_at)
+            VALUES ($1, $2, NOW(), NOW())
+            RETURNING key_id, derivation_algorithm, created_at, activated_at, deactivated_at
+            "#,
+        )
+        .bind(&next_key.key_id)
+        .bind(&next_key.derivation_algorithm)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(Json(SystemKeyRotateResponse {
+            active_key: inserted.into(),
+        }))
+    }
+    .await;
+
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "sys.keys.rotate",
+                None,
+                None,
+                None,
+                true,
+                StatusCode::OK,
+                None,
+                serde_json::json!({ "active_key_id": response.0.active_key.key_id }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "sys.keys.rotate",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(err)
+        }
+    }
+}
+
+async fn reencrypt_secrets(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<SystemKeyReencryptRequest>,
+) -> std::result::Result<Json<SystemKeyReencryptResponse>, ApiError> {
+    let request_id = request_id_from_headers(&headers);
+    let auth = authorize_root(&headers, &state).await;
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                None,
+                "sys.keys.reencrypt",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({ "batch_size": payload.batch_size }),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+
+    let result: std::result::Result<Json<SystemKeyReencryptResponse>, ApiError> = async {
+        if payload.batch_size <= 0 || payload.batch_size > 1_000 {
+            return Err(ApiError::bad_request(
+                "batch_size must be between 1 and 1000",
+            ));
+        }
+
+        let active_key = load_active_encryption_key(&state.pool).await?;
+        let stale_rows =
+            load_stale_secret_rows(&state.pool, &active_key.key_id, payload.batch_size).await?;
+
+        let mut tx = state.pool.begin().await?;
+        let mut reencrypted_count = 0_i64;
+        for row in stale_rows {
+            let plaintext = state
+                .cipher
+                .decrypt(&CiphertextEnvelope {
+                    key_id: row.key_id.clone(),
+                    algorithm: row.cipher_algorithm.clone(),
+                    payload: row.encrypted_value.clone(),
+                })
+                .await
+                .map_err(|err| ApiError::internal(format!("decrypt failed: {err}")))?;
+            let encrypted = state
+                .cipher
+                .encrypt(&plaintext, &active_key.key_id)
+                .await
+                .map_err(|err| ApiError::internal(format!("encrypt failed: {err}")))?;
+
+            let result = sqlx::query(
+                r#"
+                UPDATE secrets
+                SET encrypted_value = $1, key_id = $2, cipher_algorithm = $3
+                WHERE id = $4
+                  AND key_id = $5
+                "#,
+            )
+            .bind(&encrypted.payload)
+            .bind(&encrypted.key_id)
+            .bind(&encrypted.algorithm)
+            .bind(row.id)
+            .bind(&row.key_id)
+            .execute(&mut *tx)
+            .await?;
+
+            reencrypted_count += result.rows_affected() as i64;
+        }
+        tx.commit().await?;
+
+        let remaining_count = count_stale_ciphertext(&state.pool, &active_key.key_id).await?;
+
+        Ok(Json(SystemKeyReencryptResponse {
+            active_key_id: active_key.key_id,
+            reencrypted_count,
+            remaining_count,
+        }))
+    }
+    .await;
+
+    match result {
+        Ok(response) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "sys.keys.reencrypt",
+                None,
+                None,
+                None,
+                true,
+                StatusCode::OK,
+                None,
+                serde_json::json!({
+                    "batch_size": payload.batch_size,
+                    "active_key_id": response.0.active_key_id,
+                    "reencrypted_count": response.0.reencrypted_count,
+                    "remaining_count": response.0.remaining_count
+                }),
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(err) => {
+            write_audit_event(
+                &state.pool,
+                &request_id,
+                Some(auth.token_id),
+                "sys.keys.reencrypt",
+                None,
+                None,
+                None,
+                false,
+                err.status,
+                Some(err.message.as_str()),
+                serde_json::json!({ "batch_size": payload.batch_size }),
+            )
+            .await?;
+            Err(err)
+        }
+    }
+}
+
 async fn list_tokens(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -862,10 +1212,10 @@ async fn list_secrets(
     let result: std::result::Result<Json<SecretListResponse>, ApiError> = async {
         let rows = sqlx::query_as::<_, SecretRow>(
             r#"
-            SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+            SELECT id, mount, path, secret_key, encrypted_value, key_id, cipher_algorithm, version, created_at, updated_at, deleted_at
             FROM (
                 SELECT DISTINCT ON (mount, path, secret_key)
-                    id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+                    id, mount, path, secret_key, encrypted_value, key_id, cipher_algorithm, version, created_at, updated_at, deleted_at
                 FROM secrets
                 WHERE mount = $1 AND path LIKE $2
                 ORDER BY mount, path, secret_key, version DESC
@@ -1125,13 +1475,14 @@ async fn write_secret(
     };
 
     let result: std::result::Result<Json<SecretWriteResponse>, ApiError> = async {
+        let mut tx = state.pool.begin().await?;
+        let active_key = load_active_encryption_key_for_update(&mut tx).await?;
         let encrypted = state
             .cipher
-            .encrypt(&payload.value)
+            .encrypt(&payload.value, &active_key.key_id)
             .await
             .map_err(|err| ApiError::internal(format!("encrypt failed: {err}")))?;
 
-        let mut tx = state.pool.begin().await?;
         // Serialize version allocation per logical secret to avoid duplicate version races.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || '|' || $2 || '|' || $3))")
             .bind(&mount)
@@ -1142,23 +1493,25 @@ async fn write_secret(
 
         let row = sqlx::query_as::<_, SecretRow>(
             r#"
-            INSERT INTO secrets (mount, path, secret_key, encrypted_value, cipher_algorithm, version)
+            INSERT INTO secrets (mount, path, secret_key, encrypted_value, key_id, cipher_algorithm, version)
             SELECT
                 $1,
                 $2,
                 $3,
                 $4,
                 $5,
+                $6,
                 COALESCE(MAX(version), 0) + 1
             FROM secrets
             WHERE mount = $1 AND path = $2 AND secret_key = $3
-            RETURNING id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+            RETURNING id, mount, path, secret_key, encrypted_value, key_id, cipher_algorithm, version, created_at, updated_at, deleted_at
             "#,
         )
         .bind(&mount)
         .bind(&secret_path)
         .bind(&key)
         .bind(&encrypted.payload)
+        .bind(&encrypted.key_id)
         .bind(&encrypted.algorithm)
         .fetch_one(&mut *tx)
         .await?;
@@ -1169,6 +1522,7 @@ async fn write_secret(
             path: row.path,
             key: row.secret_key,
             version: row.version,
+            key_id: row.key_id,
         }))
     }
     .await;
@@ -1186,7 +1540,7 @@ async fn write_secret(
                 true,
                 StatusCode::OK,
                 None,
-                serde_json::json!({ "version": response.0.version }),
+                serde_json::json!({ "version": response.0.version, "key_id": response.0.key_id }),
             )
             .await?;
             Ok(response)
@@ -1613,7 +1967,7 @@ async fn load_latest_secret_row(
 ) -> std::result::Result<Option<SecretRow>, ApiError> {
     sqlx::query_as::<_, SecretRow>(
         r#"
-        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+        SELECT id, mount, path, secret_key, encrypted_value, key_id, cipher_algorithm, version, created_at, updated_at, deleted_at
         FROM secrets
         WHERE mount = $1 AND path = $2 AND secret_key = $3
         ORDER BY version DESC
@@ -1637,7 +1991,7 @@ async fn load_secret_version_row(
 ) -> std::result::Result<Option<SecretRow>, ApiError> {
     sqlx::query_as::<_, SecretRow>(
         r#"
-        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+        SELECT id, mount, path, secret_key, encrypted_value, key_id, cipher_algorithm, version, created_at, updated_at, deleted_at
         FROM secrets
         WHERE mount = $1 AND path = $2 AND secret_key = $3 AND version = $4
         "#,
@@ -1659,7 +2013,7 @@ async fn load_all_secret_versions(
 ) -> std::result::Result<Vec<SecretRow>, ApiError> {
     sqlx::query_as::<_, SecretRow>(
         r#"
-        SELECT id, mount, path, secret_key, encrypted_value, cipher_algorithm, version, created_at, updated_at, deleted_at
+        SELECT id, mount, path, secret_key, encrypted_value, key_id, cipher_algorithm, version, created_at, updated_at, deleted_at
         FROM secrets
         WHERE mount = $1 AND path = $2 AND secret_key = $3
         ORDER BY version DESC
@@ -1680,6 +2034,7 @@ async fn decrypt_secret_row(
     state
         .cipher
         .decrypt(&CiphertextEnvelope {
+            key_id: row.key_id.clone(),
             algorithm: row.cipher_algorithm.clone(),
             payload: row.encrypted_value.clone(),
         })
@@ -1765,6 +2120,94 @@ async fn load_initialized_at(
     .fetch_optional(pool)
     .await
     .map(|row| row.flatten())
+    .map_err(ApiError::from)
+}
+
+async fn load_encryption_keys(
+    pool: &PgPool,
+) -> std::result::Result<Vec<EncryptionKeyRow>, ApiError> {
+    sqlx::query_as::<_, EncryptionKeyRow>(
+        r#"
+        SELECT key_id, derivation_algorithm, created_at, activated_at, deactivated_at
+        FROM encryption_keys
+        ORDER BY activated_at DESC, created_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(ApiError::from)
+}
+
+async fn load_active_encryption_key(
+    pool: &PgPool,
+) -> std::result::Result<EncryptionKeyRow, ApiError> {
+    sqlx::query_as::<_, EncryptionKeyRow>(
+        r#"
+        SELECT key_id, derivation_algorithm, created_at, activated_at, deactivated_at
+        FROM encryption_keys
+        WHERE deactivated_at IS NULL
+        ORDER BY activated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::service_unavailable("active encryption key is missing"))
+}
+
+async fn load_active_encryption_key_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+) -> std::result::Result<EncryptionKeyRow, ApiError> {
+    sqlx::query_as::<_, EncryptionKeyRow>(
+        r#"
+        SELECT key_id, derivation_algorithm, created_at, activated_at, deactivated_at
+        FROM encryption_keys
+        WHERE deactivated_at IS NULL
+        ORDER BY activated_at DESC
+        LIMIT 1
+        FOR UPDATE
+        "#,
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| ApiError::service_unavailable("active encryption key is missing"))
+}
+
+async fn count_stale_ciphertext(
+    pool: &PgPool,
+    active_key_id: &str,
+) -> std::result::Result<i64, ApiError> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM secrets
+        WHERE key_id <> $1
+        "#,
+    )
+    .bind(active_key_id)
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::from)
+}
+
+async fn load_stale_secret_rows(
+    pool: &PgPool,
+    active_key_id: &str,
+    batch_size: i64,
+) -> std::result::Result<Vec<SecretRow>, ApiError> {
+    sqlx::query_as::<_, SecretRow>(
+        r#"
+        SELECT id, mount, path, secret_key, encrypted_value, key_id, cipher_algorithm, version, created_at, updated_at, deleted_at
+        FROM secrets
+        WHERE key_id <> $1
+        ORDER BY updated_at ASC, created_at ASC, version ASC
+        LIMIT $2
+        "#,
+    )
+    .bind(active_key_id)
+    .bind(batch_size)
+    .fetch_all(pool)
+    .await
     .map_err(ApiError::from)
 }
 
@@ -2001,6 +2444,25 @@ fn new_recovery_key() -> String {
     )
 }
 
+fn new_encryption_key_id() -> String {
+    format!(
+        "key-{}-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S"),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn new_encryption_key_row() -> SystemEncryptionKey {
+    let now = chrono::Utc::now();
+    SystemEncryptionKey {
+        key_id: new_encryption_key_id(),
+        derivation_algorithm: "aes-256-gcm+argon2id-v1".to_string(),
+        created_at: now,
+        activated_at: now,
+        deactivated_at: None,
+    }
+}
+
 fn request_id_header() -> HeaderName {
     HeaderName::from_static(REQUEST_ID_HEADER)
 }
@@ -2144,12 +2606,13 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::{
         AppState, ListQuery, PolicyCapability, ReadQuery, SecretVersionActionRequest,
-        SecretWriteRequest, authorize_capability, authorize_capability_global, create_token,
-        delete_secret, delete_token, destroy_secret, hash_token, init_system, list_secrets,
-        list_tokens, normalize_path_prefix, normalize_policy_capabilities,
-        normalize_requested_versions, read_secret, read_secret_metadata, read_system_init_status,
-        recover_root, revoke_root, rotate_root, split_secret_path, undelete_secret, validate_token,
-        write_secret,
+        SecretWriteRequest, authorize_capability, authorize_capability_global,
+        count_stale_ciphertext, create_token, delete_secret, delete_token, destroy_secret,
+        hash_token, init_system, list_encryption_keys, list_secrets, list_tokens,
+        normalize_path_prefix, normalize_policy_capabilities, normalize_requested_versions,
+        read_secret, read_secret_metadata, read_system_init_status, recover_root,
+        reencrypt_secrets, revoke_root, rotate_encryption_key, rotate_root, split_secret_path,
+        undelete_secret, validate_token, write_secret,
     };
     use axum::{
         Json,
@@ -2157,7 +2620,9 @@ mod tests {
         http::{HeaderMap, HeaderValue, StatusCode, header},
     };
     use secret_engine_core::crypto::AesGcmCipher;
-    use secret_engine_core::model::{SystemRootRecoverRequest, TokenCreateRequest, TokenScope};
+    use secret_engine_core::model::{
+        SystemKeyReencryptRequest, SystemRootRecoverRequest, TokenCreateRequest, TokenScope,
+    };
     use sqlx::PgPool;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -2171,6 +2636,12 @@ mod tests {
         secret_key: Option<String>,
         success: bool,
         status_code: i32,
+    }
+
+    #[derive(Debug, Clone, sqlx::FromRow)]
+    struct StoredSecretRow {
+        key_id: String,
+        cipher_algorithm: String,
     }
 
     #[test]
@@ -2249,6 +2720,7 @@ mod tests {
         .await
         .expect("first write");
         assert_eq!(first.0.version, 1);
+        assert_eq!(first.0.key_id, AesGcmCipher::default_key_id());
 
         let second = write_secret(
             headers.clone(),
@@ -2261,6 +2733,7 @@ mod tests {
         .await
         .expect("second write");
         assert_eq!(second.0.version, 2);
+        assert_eq!(second.0.key_id, AesGcmCipher::default_key_id());
 
         let latest = read_secret(
             headers.clone(),
@@ -2558,6 +3031,109 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn encryption_key_rotation_changes_active_key_for_new_writes(pool: PgPool) {
+        let state = test_state(pool.clone());
+        let init = init_system(State(state.clone())).await.expect("init");
+        let root_headers = bearer_headers(&init.0.root_token);
+
+        let status_before = list_encryption_keys(root_headers.clone(), State(state.clone()))
+            .await
+            .expect("list keys before rotation");
+        assert_eq!(
+            status_before.0.active_key_id,
+            AesGcmCipher::default_key_id()
+        );
+        assert_eq!(status_before.0.stale_ciphertext_count, 0);
+
+        let rotated = rotate_encryption_key(root_headers.clone(), State(state.clone()))
+            .await
+            .expect("rotate encryption key");
+        assert_ne!(rotated.0.active_key.key_id, AesGcmCipher::default_key_id());
+
+        let write = write_secret(
+            root_headers.clone(),
+            Path(("kv".to_string(), "apps/demo/password".to_string())),
+            State(state.clone()),
+            Json(SecretWriteRequest {
+                value: "value-v1".to_string(),
+            }),
+        )
+        .await
+        .expect("write after key rotation");
+        assert_eq!(write.0.key_id, rotated.0.active_key.key_id);
+
+        let stored = load_stored_secret_row(&pool, "kv", "apps/demo", "password", 1).await;
+        assert_eq!(stored.key_id, rotated.0.active_key.key_id);
+        assert_eq!(
+            stored.cipher_algorithm,
+            format!("aes-256-gcm+argon2id-v1:{}", rotated.0.active_key.key_id)
+        );
+
+        let status_after = list_encryption_keys(root_headers, State(state.clone()))
+            .await
+            .expect("list keys after rotation");
+        assert_eq!(status_after.0.active_key_id, rotated.0.active_key.key_id);
+        assert_eq!(status_after.0.stale_ciphertext_count, 0);
+        assert_eq!(status_after.0.keys.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn reencrypt_updates_existing_ciphertext_to_active_key(pool: PgPool) {
+        let state = test_state(pool.clone());
+        let init = init_system(State(state.clone())).await.expect("init");
+        let root_headers = bearer_headers(&init.0.root_token);
+
+        let _ = write_secret(
+            root_headers.clone(),
+            Path(("kv".to_string(), "apps/demo/password".to_string())),
+            State(state.clone()),
+            Json(SecretWriteRequest {
+                value: "value-v1".to_string(),
+            }),
+        )
+        .await
+        .expect("initial write");
+
+        let original = load_stored_secret_row(&pool, "kv", "apps/demo", "password", 1).await;
+        assert_eq!(original.key_id, AesGcmCipher::default_key_id());
+
+        let rotated = rotate_encryption_key(root_headers.clone(), State(state.clone()))
+            .await
+            .expect("rotate encryption key");
+        let stale_before = count_stale_ciphertext(&pool, &rotated.0.active_key.key_id)
+            .await
+            .expect("count stale before");
+        assert_eq!(stale_before, 1);
+
+        let reencrypted = reencrypt_secrets(
+            root_headers.clone(),
+            State(state.clone()),
+            Json(SystemKeyReencryptRequest { batch_size: 10 }),
+        )
+        .await
+        .expect("reencrypt");
+        assert_eq!(reencrypted.0.reencrypted_count, 1);
+        assert_eq!(reencrypted.0.remaining_count, 0);
+
+        let updated = load_stored_secret_row(&pool, "kv", "apps/demo", "password", 1).await;
+        assert_eq!(updated.key_id, rotated.0.active_key.key_id);
+        assert_eq!(
+            updated.cipher_algorithm,
+            format!("aes-256-gcm+argon2id-v1:{}", rotated.0.active_key.key_id)
+        );
+
+        let read = read_secret(
+            root_headers,
+            Path(("kv".to_string(), "apps/demo/password".to_string())),
+            Query(ReadQuery { version: Some(1) }),
+            State(state),
+        )
+        .await
+        .expect("read reencrypted secret");
+        assert_eq!(read.0.value, "value-v1");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn audit_records_kv_reads_and_mutations(pool: PgPool) {
         let state = test_state(pool.clone());
         let headers = with_request_id(admin_headers(&pool).await, "req-kv-audit");
@@ -2746,5 +3322,28 @@ mod tests {
         .fetch_all(pool)
         .await
         .expect("load audit rows")
+    }
+
+    async fn load_stored_secret_row(
+        pool: &PgPool,
+        mount: &str,
+        path: &str,
+        key: &str,
+        version: i32,
+    ) -> StoredSecretRow {
+        sqlx::query_as::<_, StoredSecretRow>(
+            r#"
+            SELECT key_id, cipher_algorithm
+            FROM secrets
+            WHERE mount = $1 AND path = $2 AND secret_key = $3 AND version = $4
+            "#,
+        )
+        .bind(mount)
+        .bind(path)
+        .bind(key)
+        .bind(version)
+        .fetch_one(pool)
+        .await
+        .expect("load stored secret row")
     }
 }
